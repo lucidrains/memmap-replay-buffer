@@ -1,6 +1,6 @@
 [project]
 name = "memmap-replay-buffer"
-version = "0.0.1"
+version = "0.0.2"
 description = "Simple Replay Buffer for RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -24,6 +24,7 @@ classifiers=[
 
 dependencies = [
     "beartype",
+    "numpy",
     "torch>=2.4"
 ]
 
