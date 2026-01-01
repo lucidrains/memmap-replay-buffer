@@ -126,74 +126,6 @@ class ReplayDataset(Dataset):
         data['_lens'] = tensor(episode_len)
         return data
 
-class RemappedReplayDataset(Dataset):
-    def __init__(
-        self,
-        dataset: ReplayDataset,
-        episode_mapping: Tensor | list[list[int]],
-        shuffle_episodes = False,
-        num_trials_select = None
-    ):
-        assert len(dataset) > 0
-        self.dataset = dataset
-
-        if is_tensor(episode_mapping):
-            assert episode_mapping.dtype in (torch.int, torch.long) and episode_mapping.ndim == 2
-            episode_mapping = episode_mapping.tolist()
-
-        self.episode_mapping = episode_mapping
-        self.shuffle_episodes = shuffle_episodes
-
-        assert not (exists(num_trials_select) and num_trials_select <= 0)
-        self.sub_select_trials = exists(num_trials_select)
-        self.num_trials_select = num_trials_select
-
-    def __len__(self):
-        return len(self.episode_mapping)
-
-    def __getitem__(self, idx):
-
-        episode_indices = self.episode_mapping[idx]
-
-        episode_indices = tensor(episode_indices)
-        episode_indices = episode_indices[(episode_indices >= 0) & (episode_indices < len(self.dataset))]
-
-        assert not is_empty(episode_indices)
-
-        # shuffle the episode indices if either shuffle episodes is turned on, or `num_trial_select` passed in (for sub selecting episodes from a set)
-
-        if (
-            episode_indices.numel() > 1 and
-            (self.shuffle_episodes or self.sub_select_trials)
-        ):
-            num_episodes = len(episode_indices)
-            episode_indices = episode_indices[torch.randperm(num_episodes)]
-
-        # crop out the episodes
-
-        if self.sub_select_trials:
-            episode_indices = episode_indices[:self.num_trials_select]
-
-        # now select out the episode data and merge along time
-
-        episode_data = [self.dataset[i] for i in episode_indices.tolist()]
-
-        episode_lens = stack([data.pop('_lens') for data in episode_data])
-
-        keys = first(episode_data).keys()
-
-        values = [list(data.values()) for data in episode_data]
-
-        values = [cat(field_values) for field_values in zip(*values)] # concat across time
-
-        multi_episode_data = dict(zip(keys, values))
-
-        multi_episode_data['_lens'] = episode_lens.sum()
-
-        multi_episode_data['_episode_indices'] = cat([torch.full((episode_len,), episode_index) for episode_len, episode_index in zip(episode_lens, episode_indices)])
-
-        return multi_episode_data
-
 class ReplayBuffer:
 
     @beartype
@@ -389,25 +321,23 @@ class ReplayBuffer:
 
     def dataset(
         self,
-        episode_mapping: Tensor | list[list[int]] | None = None,
         fields: tuple[str, ...] | None = None
     ) -> Dataset:
         self.flush()
 
         dataset = ReplayDataset(self.folder, fields)
-
-        if not exists(episode_mapping):
-            return dataset
-
-        return RemappedReplayDataset(dataset, episode_mapping)
+        return dataset
 
     def dataloader(
         self,
         batch_size,
-        episode_mapping: Tensor | list[list[int]] | None = None,
+        dataset: Dataset | None = None,
         fields: tuple[str, ...] | None = None,
         **kwargs
     ) -> DataLoader:
         self.flush()
 
-        return DataLoader(self.dataset(episode_mapping, fields), batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
+        if not exists(dataset):
+            dataset = self.dataset(fields)
+
+        return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
