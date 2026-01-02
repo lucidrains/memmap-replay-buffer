@@ -338,6 +338,14 @@ class ReplayBuffer:
         self.flush()
 
     @property
+    def data(self):
+        return self.memmaps
+
+    @property
+    def meta_data(self):
+        return self.meta_memmaps
+
+    @property
     def episode_lens(self):
         return self.meta_memmaps['episode_lens']
 
