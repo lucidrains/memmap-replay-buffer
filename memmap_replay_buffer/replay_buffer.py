@@ -1,7 +1,9 @@
 from __future__ import annotations
+import pickle
 from typing import Callable
 from beartype import beartype
 from beartype.door import is_bearable
+from beartype.typing import Literal
 
 from pathlib import Path
 from shutil import rmtree
@@ -20,6 +22,14 @@ from torch.utils.data import Dataset, DataLoader
 # constants
 
 PrimitiveType = int | float | bool
+
+PrimitiveTypeStr = Literal['int', 'float', 'bool']
+
+FieldInfo = (
+    PrimitiveTypeStr |
+    tuple[PrimitiveTypeStr, int | tuple[int, ...]] |
+    tuple[PrimitiveTypeStr, int | tuple[int, ...], PrimitiveType]
+)
 
 # helpers
 
@@ -85,8 +95,8 @@ class ReplayDataset(Dataset):
         if isinstance(folder, str):
             folder = Path(folder)
 
-        episode_lens = folder / 'episode_lens.data.meta.npy'
-        self.episode_lens = open_memmap(str(episode_lens), mode = 'r')
+        episode_lens_path = folder / 'episode_lens.data.meta.npy'
+        self.episode_lens = open_memmap(str(episode_lens_path), mode = 'r')
 
         # get indices of non-zero lengthed episodes
 
@@ -134,103 +144,198 @@ class ReplayBuffer:
         folder: str | Path,
         max_episodes: int,
         max_timesteps: int,
-        fields: dict[
-            str,
-            str | tuple[str, int | tuple[int, ...]]
-        ],
-        meta_fields: dict[
-            str,
-            str | tuple[str, int | tuple[int, ...]]
-        ] = dict()
+        fields: dict[str, FieldInfo],
+        meta_fields: dict[str, FieldInfo] = dict(),
+        circular = False,
+        overwrite = True
     ):
 
         # folder for data
 
         if not isinstance(folder, Path):
             folder = Path(folder)
-            folder.mkdir(exist_ok = True, parents = True)
+            
+        folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
         assert folder.is_dir()
 
-        # keeping track of episode length
+        # save the config if not exists
 
-        self.episode_index = 0
-        self.timestep_index = 0
+        config_path = folder / 'metadata.pkl'
 
-        self.num_episodes = 0
+        if not config_path.exists() or overwrite:
+            config = dict(
+                max_episodes = max_episodes,
+                max_timesteps = max_timesteps,
+                fields = fields,
+                meta_fields = meta_fields,
+                circular = circular
+            )
+
+            with open(str(config_path), 'wb') as f:
+                pickle.dump(config, f)
+
+        # keeping track of state
+
+        num_episodes_path = folder / 'num_episodes.state.npy'
+        episode_index_path = folder / 'episode_index.state.npy'
+        timestep_index_path = folder / 'timestep_index.state.npy'
+
+        self._num_episodes = open_memmap(str(num_episodes_path), mode = 'w+' if not num_episodes_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+        self._episode_index = open_memmap(str(episode_index_path), mode = 'w+' if not episode_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+        self._timestep_index = open_memmap(str(timestep_index_path), mode = 'w+' if not timestep_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+
+        if overwrite:
+            self.num_episodes = 0
+            self.episode_index = 0
+            self.timestep_index = 0
+
         self.max_episodes = max_episodes
-        self.max_timesteps= max_timesteps
+        self.max_timesteps = max_timesteps
+        self.circular = circular
 
-        assert not 'episode_lens' in meta_fields
-        meta_fields.update(episode_lens = 'int')
+        if 'episode_lens' not in meta_fields:
+            meta_fields = meta_fields.copy()
+            meta_fields.update(episode_lens = 'int')
 
         # create the memmap for meta data tracks
 
         self.meta_shapes = dict()
         self.meta_dtypes = dict()
         self.meta_memmaps = dict()
+        self.meta_defaults = dict()
         self.meta_fieldnames = set(meta_fields.keys())
 
         def parse_field_info(field_info):
-            # some flexibility
+            if isinstance(field_info, str):
+                field_info = (field_info, (), None)
 
-            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+            elif is_bearable(field_info, tuple[str, int | tuple[int, ...]]):
+                field_info = (*field_info, None)
 
-            dtype_str, shape = field_info
+            dtype_str, shape, default_value = field_info
             assert dtype_str in {'int', 'float', 'bool'}
 
             dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
-            return dtype, shape
+
+            if isinstance(shape, int):
+                shape = (shape,)
+
+            return dtype, shape, default_value
 
         for field_name, field_info in meta_fields.items():
 
-            dtype, shape = parse_field_info(field_info)
+            dtype, shape, default_value = parse_field_info(field_info)
 
             # memmap file
 
             filepath = folder / f'{field_name}.data.meta.npy'
 
-            if isinstance(shape, int):
-                shape = (shape,)
+            memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, *shape))
 
-            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, *shape))
+            if overwrite:
+                if exists(default_value):
+                    memmap[:] = default_value
+                else:
+                    memmap[:] = 0
 
             self.meta_memmaps[field_name] = memmap
             self.meta_shapes[field_name] = shape
             self.meta_dtypes[field_name] = dtype
+            self.meta_defaults[field_name] = default_value
 
         # create the memmap for individual data tracks
 
         self.shapes = dict()
         self.dtypes = dict()
         self.memmaps = dict()
+        self.defaults = dict()
         self.fieldnames = set(fields.keys())
 
         for field_name, field_info in fields.items():
 
-            dtype, shape = parse_field_info(field_info)
+            dtype, shape, default_value = parse_field_info(field_info)
 
             # memmap file
 
             filepath = folder / f'{field_name}.data.npy'
 
-            if isinstance(shape, int):
-                shape = (shape,)
+            memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
 
-            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+            if overwrite:
+                if exists(default_value):
+                    memmap[:] = default_value
+                else:
+                    memmap[:] = 0
 
             self.memmaps[field_name] = memmap
             self.shapes[field_name] = shape
             self.dtypes[field_name] = dtype
+            self.defaults[field_name] = default_value
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
+
+    @classmethod
+    def from_config(cls, folder: str | Path):
+        if isinstance(folder, str):
+            folder = Path(folder)
+
+        config_path = folder / 'metadata.pkl'
+        assert config_path.exists(), f'metadata.pkl not found in {folder}'
+
+        with open(str(config_path), 'rb') as f:
+            config = pickle.load(f)
+
+        return cls(folder = folder, overwrite = False, **config)
+
+    @property
+    def num_episodes(self):
+        return self._num_episodes.item()
+
+    @num_episodes.setter
+    def num_episodes(self, value):
+        self._num_episodes[()] = value
+        self._num_episodes.flush()
+
+    @property
+    def episode_index(self):
+        return self._episode_index.item()
+
+    @episode_index.setter
+    def episode_index(self, value):
+        self._episode_index[()] = value
+        self._episode_index.flush()
+
+    @property
+    def timestep_index(self):
+        return self._timestep_index.item()
+
+    @timestep_index.setter
+    def timestep_index(self, value):
+        self._timestep_index[()] = value
+        self._timestep_index.flush()
 
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
 
     def clear(self):
-        rmtree(str(self.folder), ignore_errors = True)
+        for name, memmap in self.memmaps.items():
+            default_value = self.defaults[name]
+            if exists(default_value):
+                memmap[:] = default_value
+            else:
+                memmap[:] = 0
+
+        for name, memmap in self.meta_memmaps.items():
+            default_value = self.meta_defaults[name]
+            if exists(default_value):
+                memmap[:] = default_value
+            else:
+                memmap[:] = 0
+
+        self.reset_()
+        self.flush()
 
     @property
     def episode_lens(self):
@@ -238,13 +343,22 @@ class ReplayBuffer:
 
     def reset_(self):
         self.episode_lens[:] = 0
+        self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
 
     def advance_episode(self):
+        if not self.circular and self.num_episodes >= self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
+
+        self.episode_lens[self.episode_index] = self.timestep_index
+
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
         self.num_episodes += 1
+
+        if self.circular:
+            self.num_episodes = min(self.num_episodes, self.max_episodes)
 
     def flush(self):
         self.episode_lens[self.episode_index] = self.timestep_index
@@ -252,25 +366,27 @@ class ReplayBuffer:
         for memmap in self.memmaps.values():
             memmap.flush()
 
-        self.episode_lens.flush()
+        for memmap in self.meta_memmaps.values():
+            memmap.flush()
+
+        self._num_episodes.flush()
+        self._episode_index.flush()
+        self._timestep_index.flush()
 
     @contextmanager
-    def one_episode(self):
+    def one_episode(self, **meta_data):
+        if not self.circular and self.num_episodes >= self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
-        # storing data before exiting the context
+        for name, value in meta_data.items():
+            self.store_meta_datapoint(self.episode_index, name, value)
 
         final_meta_data_store = dict()
 
         yield final_meta_data_store
 
-        # store meta data for use in constructing sequences for learning
-
-        for key, value in final_meta_data_store.items():
-            assert key in self.meta_memmaps, f'{key} not defined in `meta_fields` on init'
-
-            self.meta_memmaps[key][self.episode_index] = value
-
-        # flush and advance
+        for name, value in final_meta_data_store.items():
+            self.store_meta_datapoint(self.episode_index, name, value)
 
         self.flush()
         self.advance_episode()
@@ -286,11 +402,11 @@ class ReplayBuffer:
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
 
-        if is_bearable(datapoint, PrimitiveType):
-            datapoint = tensor(datapoint)
-            
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
+
+        if is_bearable(datapoint, PrimitiveType):
+            datapoint = np.array(datapoint)
 
         assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
 
@@ -298,11 +414,33 @@ class ReplayBuffer:
 
         self.memmaps[name][episode_index, timestep_index] = datapoint
 
+    @beartype
+    def store_meta_datapoint(
+        self,
+        episode_index: int,
+        name: str,
+        datapoint: PrimitiveType | Tensor | ndarray
+    ):
+        assert 0 <= episode_index < self.max_episodes
+
+        if is_tensor(datapoint):
+            datapoint = datapoint.detach().cpu().numpy()
+
+        if is_bearable(datapoint, PrimitiveType):
+            datapoint = np.array(datapoint)
+
+        assert name in self.meta_fieldnames, f'invalid field name {name} - must be one of {self.meta_fieldnames}'
+
+        assert datapoint.shape == self.meta_shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}'
+
+        self.meta_memmaps[name][episode_index] = datapoint
+
     def store(
         self,
         **data
     ):
-        assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
+        if self.timestep_index >= self.max_timesteps:
+            raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
 
         # filter to only what is defined in the namedtuple, and store those that are present
 
@@ -310,15 +448,26 @@ class ReplayBuffer:
 
         for name in self.memory_namedtuple._fields:
             datapoint = data.get(name)
-            store_data[name] = datapoint
 
-            if exists(datapoint):
-                self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
+            if not exists(datapoint):
+                default_value = self.defaults[name]
+
+                if exists(default_value):
+                    datapoint = default_value
+                else:
+                    datapoint = np.zeros(self.shapes[name], dtype = self.dtypes[name])
+
+            if is_bearable(datapoint, PrimitiveType) or np.isscalar(datapoint):
+                datapoint = np.full(self.shapes[name], datapoint, dtype = self.dtypes[name])
+
+            store_data[name] = datapoint
+            self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
         self.timestep_index += 1
 
         return self.memory_namedtuple(**store_data)
 
+    @beartype
     def dataset(
         self,
         fields: tuple[str, ...] | None = None
@@ -328,6 +477,7 @@ class ReplayBuffer:
         dataset = ReplayDataset(self.folder, fields)
         return dataset
 
+    @beartype
     def dataloader(
         self,
         batch_size,
