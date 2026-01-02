@@ -1,4 +1,4 @@
-# memmap-replay-buffer
+## memmap-replay-buffer
 
 An easy-to-use numpy memmap replay buffer for RL and other sequence-based learning tasks.
 
@@ -63,4 +63,3 @@ for batch in dataloader:
     assert reward.shape == (2, 100)
     assert lens.shape   == (2,)
 ```
-
