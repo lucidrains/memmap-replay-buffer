@@ -21,9 +21,9 @@ buffer = ReplayBuffer(
     max_episodes = 1000,
     max_timesteps = 500,
     fields = dict(
-        state = ('float', (8,), 0.5),   # type, shape, and optional default value
-        action = ('int', (2,)),
-        reward = 'float'                # default shape is ()
+        state = ('float', (3, 16, 16), 0.),    # type, shape, and optional default value
+        action = ('int', 2),
+        reward = 'float'                       # default shape is ()
     ),
     meta_fields = dict(
         task_id = 'int'
@@ -38,8 +38,8 @@ for _ in range(4):
     with buffer.one_episode(task_id = 1):
         for _ in range(100):
             buffer.store(
-                state = torch.randn(8).numpy(),
-                action = torch.randint(0, 4, (2,)),
+                state = torch.randn(3, 16, 16),
+                action = torch.randint(0, 4, (2,)).numpy(),
                 reward = 1.0
             )
 
@@ -48,17 +48,17 @@ for _ in range(4):
 buffer_rehydrated = ReplayBuffer.from_config('./replay_data')
 assert buffer_rehydrated.num_episodes == 4
 
-# learn 2 episodes at a time
+# train 2 episodes batch size
 
 dataloader = buffer.dataloader(batch_size = 2)
 
 for batch in dataloader:
-    state = batch['state']    # (2, 100, 8)
+    state = batch['state']    # (2, 100, 3, 16, 16)
     action = batch['action']  # (2, 100)
     reward = batch['reward']  # (2, 100)
     lens = batch['_lens']     # (2,)
 
-    assert state.shape  == (2, 100, 8)
+    assert state.shape  == (2, 100, 3, 16, 16)
     assert action.shape == (2, 100, 2)
     assert reward.shape == (2, 100)
     assert lens.shape   == (2,)
