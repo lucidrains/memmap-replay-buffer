@@ -32,7 +32,7 @@ buffer = ReplayBuffer(
     overwrite = True
 )
 
-# store an episode
+# store 4 episodes
 
 for _ in range(4):
     with buffer.one_episode(task_id = 1):
@@ -48,7 +48,7 @@ for _ in range(4):
 buffer_rehydrated = ReplayBuffer.from_config('./replay_data')
 assert buffer_rehydrated.num_episodes == 4
 
-# setup dataloader
+# learn 2 episodes at a time
 
 dataloader = buffer.dataloader(batch_size = 2)
 
