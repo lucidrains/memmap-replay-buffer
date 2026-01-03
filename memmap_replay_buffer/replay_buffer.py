@@ -649,6 +649,41 @@ class ReplayBuffer:
 
         return self.memory_namedtuple(**store_data)
 
+    def get_all_data(
+        self,
+        fields: tuple[str, ...] | None = None,
+        meta_fields: tuple[str, ...] | None = None
+    ):
+        self.flush()
+
+        n = self.num_episodes
+
+        if n == 0:
+            return dict()
+
+        max_len = self.episode_lens[:n].max()
+
+        all_data = dict()
+
+        # sub-select fields and meta fields
+
+        if not exists(fields) and not exists(meta_fields):
+            data_fields = self.fieldnames
+            meta_data_fields = self.meta_fieldnames
+        else:
+            data_fields = default(fields, ())
+            meta_data_fields = default(meta_fields, ())
+
+        for name in data_fields:
+            memmap = self.data[name]
+            all_data[name] = from_numpy(memmap[:n, :max_len].copy())
+
+        for name in meta_data_fields:
+            memmap = self.meta_data[name]
+            all_data[name] = from_numpy(memmap[:n].copy())
+
+        return all_data
+
     @beartype
     def dataset(
         self,
