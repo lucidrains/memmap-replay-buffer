@@ -669,6 +669,7 @@ class ReplayBuffer:
         filter_fields: dict | None = None,
         fieldname_map: dict[str, str] | None = None,
         return_indices: bool = False,
+        return_mask: bool = False,
         timestep_level: bool = False,
         to_named_tuple: tuple[str, ...] | None = None,
         shuffle = False,
@@ -682,6 +683,8 @@ class ReplayBuffer:
         # if to_named_tuple is specified, don't filter dataset fields
         if exists(to_named_tuple):
             assert not exists(fields), 'cannot specify both fields and to_named_tuple'
+
+        assert not (return_mask and timestep_level), 'return_mask is only supported for trajectory-level data'
 
         if not exists(dataset):
             dataset = self.dataset(
@@ -718,6 +721,11 @@ class ReplayBuffer:
                 batch = base_collate_fn(data)
             else:
                 batch = default_collate(data)
+
+            if return_mask:
+                lens = batch['_lens']
+                max_len = lens.amax().item()
+                batch['_mask'] = einx.less('j, i -> i j', arange(max_len, device = lens.device), lens)
 
             if exists(to_named_tuple):
                 for field in to_named_tuple:

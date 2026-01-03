@@ -52,15 +52,18 @@ assert buffer_rehydrated.num_episodes == 4
 
 dataloader = buffer.dataloader(
     batch_size = 2,
-    to_named_tuple = ('state', 'action', 'reward', 'task_id', '_lens')
+    return_mask = True,
+    to_named_tuple = ('state', 'action', 'reward', 'task_id', '_mask', '_lens')
 )
 
-for state, action, reward, task_id, lens in dataloader:
+for state, action, reward, task_id, mask, lens in dataloader:
     assert state.shape   == (2, 100, 3, 16, 16)
     assert action.shape  == (2, 100, 2)
     assert reward.shape  == (2, 100)
     assert task_id.shape == (2,)
+
     assert lens.shape    == (2,)
+    assert mask.shape    == (2, 100)
 
 # for loading per timestep
 
