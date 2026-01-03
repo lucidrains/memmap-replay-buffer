@@ -1,10 +1,11 @@
 from __future__ import annotations
-import pickle
 from typing import Callable
 from beartype import beartype
 from beartype.door import is_bearable
 from beartype.typing import Literal
 
+import pickle
+from functools import partial
 from pathlib import Path
 from shutil import rmtree
 from contextlib import contextmanager
@@ -15,9 +16,13 @@ from numpy import ndarray
 from numpy.lib.format import open_memmap
 
 import torch
-from torch import tensor, from_numpy, stack, cat, is_tensor, Tensor, arange
+from torch import tensor, from_numpy as torch_from_numpy, stack, cat, is_tensor, Tensor, arange, broadcast_tensors
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, default_collate
+from torch.utils._pytree import tree_map
+
+import einx
+from einops import rearrange
 
 # constants
 
@@ -48,6 +53,11 @@ def xnor(x, y):
 def is_empty(t):
     return t.numel() == 0
 
+def from_numpy(arr: ndarray):
+    if np.isscalar(arr) or arr.ndim == 0:
+        arr = np.array(arr)
+    return torch_from_numpy(arr)
+
 def pad_at_dim(
     t,
     pad: tuple[int, int],
@@ -61,9 +71,14 @@ def pad_at_dim(
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
+def tree_map_to_device(batch, device):
+    if not exists(device):
+        return batch
+    return tree_map(lambda t: t.to(device) if is_tensor(t) else t, batch)
+
 # data
 
-def collate_var_time(data):
+def collate_var_time(data, fields_to_pad = None):
 
     datum = first(data)
     keys = datum.keys()
@@ -73,10 +88,14 @@ def collate_var_time(data):
     collated_values = []
 
     for key, tensors in zip(keys, all_tensors):
+        tensors = list(tensors)
 
-        # the episode lens have zero dimension - think of a cleaner way to handle this later
-
-        if key != '_lens':
+        # only pad fields that are explicitly requested as trajectories
+        # and have more than 0 dimensions
+        
+        is_trajectory = exists(fields_to_pad) and key in fields_to_pad
+        
+        if is_trajectory and tensors[0].ndim > 0:
 
             times = [t.shape[0] for t in tensors]
             max_time = max(times)
@@ -86,42 +105,82 @@ def collate_var_time(data):
 
     return dict(zip(keys, collated_values))
 
-class ReplayDataset(Dataset):
+class ReplayDatasetTrajectory(Dataset):
+    """Dataset that returns full episodes (variable length trajectories)."""
+    
     def __init__(
         self,
-        folder: str | Path,
-        fields: tuple[str, ...] | None = None
+        replay_buffer: str | Path | ReplayBuffer,
+        fields: tuple[str, ...] | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        include_metadata: bool = True,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        return_indices: bool = False,
+        **kwargs
     ):
-        if isinstance(folder, str):
-            folder = Path(folder)
+        # accept either folder path or ReplayBuffer instance
 
-        episode_lens_path = folder / 'episode_lens.data.meta.npy'
-        self.episode_lens = open_memmap(str(episode_lens_path), mode = 'r')
+        if isinstance(replay_buffer, (str, Path)):
+            self.replay_buffer = ReplayBuffer.from_folder(replay_buffer)
+        else:
+            self.replay_buffer = replay_buffer
 
-        # get indices of non-zero lengthed episodes
+        self.return_indices = return_indices
+        self.fieldname_map = default(fieldname_map, {})
 
-        nonzero_episodes = self.episode_lens > 0
-        self.indices = np.arange(self.episode_lens.shape[-1])[nonzero_episodes]
+        # start with non-zero length episodes
+        
+        valid_mask = self.replay_buffer.episode_lens > 0
 
-        # get all data files
+        # apply meta field filters
 
-        filepaths = [*folder.glob('*.data.npy')]
-        assert len(filepaths) > 0
+        if exists(filter_meta):
+            for field_name, filter_value in filter_meta.items():
+                field_data = self.replay_buffer.meta_data[field_name]
+                if isinstance(filter_value, bool):
+                    if filter_value:
+                        valid_mask = valid_mask & field_data.astype(bool)
+                    else:
+                        valid_mask = valid_mask & ~field_data.astype(bool)
+                else:
+                    valid_mask = valid_mask & (field_data == filter_value)
 
-        fieldname_to_filepath = {path.name.split('.')[0]: path for path in filepaths}
+        self.indices = np.arange(self.replay_buffer.episode_lens.shape[-1])[valid_mask]
 
-        fieldnames_from_files = set(fieldname_to_filepath.keys())
+        # filter to requested fields
 
-        fields = default(fields, fieldnames_from_files)
+        if exists(fields):
+            self.fields = fields
+        else:
+            self.fields = tuple(self.replay_buffer.fieldnames)
 
-        self.memmaps = dict()
+        # apply field filters (trajectory-level, matches if any timestep passes)
+        # only supported if timestep_level is False (which it is here)
 
-        for field in fields:
-            assert field in fieldnames_from_files, f'invalid field {field} - must be one of {fieldnames_from_files}'
+        if exists(filter_fields):
+            for field_name, filter_value in filter_fields.items():
+                field_data = self.replay_buffer.data[field_name]
+                if isinstance(filter_value, bool):
+                    matches = field_data.astype(bool) if filter_value else ~field_data.astype(bool)
+                else:
+                    matches = field_data == filter_value
 
-            path = fieldname_to_filepath[field]
+                # for trajectory level, we include the episode if ANY timestep matches the filter
+                # common use case: filter episodes that have a 'learnable' timestep
+                ep_matches = np.any(matches, axis = 1)
+                valid_mask = valid_mask & ep_matches[:self.replay_buffer.max_episodes]
 
-            self.memmaps[field] = open_memmap(str(path), mode = 'r')
+        self.indices = np.arange(self.replay_buffer.max_episodes)[valid_mask]
+
+        # exclude episode_lens from meta_data (it's handled separately as _lens)
+
+        self.include_metadata = include_metadata
+
+        if include_metadata:
+            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k != 'episode_lens'}
+        else:
+            self.meta_data = {}
 
     def __len__(self):
         return len(self.indices)
@@ -129,12 +188,119 @@ class ReplayDataset(Dataset):
     def __getitem__(self, idx):
         episode_index = self.indices[idx]
 
-        episode_len = self.episode_lens[episode_index]
+        episode_len = self.replay_buffer.episode_lens[episode_index]
 
-        data = {field: from_numpy(memmap[episode_index, :episode_len].copy()) for field, memmap in self.memmaps.items()}
+        data = dict()
+        for field in self.fields:
+            memmap = self.replay_buffer.data[field]
+            mapped_name = self.fieldname_map.get(field, field)
+            data[mapped_name] = from_numpy(memmap[episode_index, :episode_len].copy())
+
+        # add meta fields (without time dimension)
+
+        for field, memmap in self.meta_data.items():
+            mapped_name = self.fieldname_map.get(field, field)
+            data[mapped_name] = from_numpy(memmap[episode_index].copy())
 
         data['_lens'] = tensor(episode_len)
+
+        if self.return_indices:
+            data['_index'] = tensor(episode_index)
+
         return data
+
+
+class ReplayDatasetTimestep(Dataset):
+    """Dataset that returns individual timesteps."""
+    
+    def __init__(
+        self,
+        replay_buffer: 'ReplayBuffer',
+        fields: tuple[str, ...] | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        return_indices: bool = False,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        **kwargs
+    ):
+        self.replay_buffer = replay_buffer
+        self.return_indices = return_indices
+        self.fieldname_map = default(fieldname_map, {})
+
+        episode_ids = arange(replay_buffer.max_episodes)
+        episode_lens = from_numpy(replay_buffer.episode_lens)
+
+        max_episode_len = episode_lens.amax().item()
+
+        # start with non-zero length episodes
+        
+        valid_mask = episode_lens > 0
+
+        # apply meta field filters (episode-level)
+
+        if exists(filter_meta):
+            for field_name, filter_value in filter_meta.items():
+                field_data = from_numpy(replay_buffer.meta_data[field_name])
+                if isinstance(filter_value, bool):
+                    if filter_value:
+                        valid_mask = valid_mask & field_data.bool()
+                    else:
+                        valid_mask = valid_mask & ~field_data.bool()
+                else:
+                    valid_mask = valid_mask & (field_data == filter_value)
+
+        valid_episodes = episode_ids[valid_mask]
+        self.valid_episodes = valid_episodes
+        valid_episode_lens = episode_lens[valid_mask]
+
+        timesteps = arange(max_episode_len)
+
+        episode_timesteps = stack(broadcast_tensors(
+            rearrange(valid_episodes, 'e -> e 1'),
+            rearrange(timesteps, 't -> 1 t')
+        ), dim = -1)
+
+        valid_timesteps = einx.less('j, i -> i j', timesteps, valid_episode_lens)
+
+        # apply field filters (timestep-level)
+
+        if exists(filter_fields):
+            for field_name, filter_value in filter_fields.items():
+                field_data = from_numpy(replay_buffer.data[field_name][valid_episodes.numpy(), :max_episode_len])
+                if isinstance(filter_value, bool):
+                    if filter_value:
+                        valid_timesteps = valid_timesteps & field_data.bool()
+                    else:
+                        valid_timesteps = valid_timesteps & ~field_data.bool()
+                else:
+                    valid_timesteps = valid_timesteps & (field_data == filter_value)
+
+        self.timepoints = episode_timesteps[valid_timesteps]
+
+        self.fields = default(fields, tuple(replay_buffer.fieldnames))
+
+    def __len__(self):
+        return len(self.timepoints)
+
+    def __getitem__(self, idx):
+        episode_id, timestep_index = self.timepoints[idx].unbind(dim = -1)
+
+        step_data = dict()
+
+        for field in self.fields:
+            data = self.replay_buffer.data[field]
+            model_kwarg_name = self.fieldname_map.get(field, field)
+            step_data[model_kwarg_name] = from_numpy(data[episode_id, timestep_index].copy())
+
+        if self.return_indices:
+            step_data['_indices'] = self.timepoints[idx]
+
+        return step_data
+
+
+# backwards compatibility alias
+
+ReplayDataset = ReplayDatasetTrajectory
 
 class ReplayBuffer:
 
@@ -203,7 +369,7 @@ class ReplayBuffer:
 
         self.meta_shapes = dict()
         self.meta_dtypes = dict()
-        self.meta_memmaps = dict()
+        self.meta_data = dict()
         self.meta_defaults = dict()
         self.meta_fieldnames = set(meta_fields.keys())
 
@@ -211,7 +377,7 @@ class ReplayBuffer:
             if isinstance(field_info, str):
                 field_info = (field_info, (), None)
 
-            elif is_bearable(field_info, tuple[str, int | tuple[int, ...]]):
+            elif isinstance(field_info, tuple) and len(field_info) == 2:
                 field_info = (*field_info, None)
 
             dtype_str, shape, default_value = field_info
@@ -240,7 +406,7 @@ class ReplayBuffer:
                 else:
                     memmap[:] = 0
 
-            self.meta_memmaps[field_name] = memmap
+            self.meta_data[field_name] = memmap
             self.meta_shapes[field_name] = shape
             self.meta_dtypes[field_name] = dtype
             self.meta_defaults[field_name] = default_value
@@ -249,7 +415,7 @@ class ReplayBuffer:
 
         self.shapes = dict()
         self.dtypes = dict()
-        self.memmaps = dict()
+        self.data = dict()
         self.defaults = dict()
         self.fieldnames = set(fields.keys())
 
@@ -269,7 +435,7 @@ class ReplayBuffer:
                 else:
                     memmap[:] = 0
 
-            self.memmaps[field_name] = memmap
+            self.data[field_name] = memmap
             self.shapes[field_name] = shape
             self.dtypes[field_name] = dtype
             self.defaults[field_name] = default_value
@@ -277,7 +443,7 @@ class ReplayBuffer:
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
     @classmethod
-    def from_config(cls, folder: str | Path):
+    def from_folder(cls, folder: str | Path):
         if isinstance(folder, str):
             folder = Path(folder)
 
@@ -320,14 +486,14 @@ class ReplayBuffer:
         return (self.episode_lens > 0).sum().item()
 
     def clear(self):
-        for name, memmap in self.memmaps.items():
+        for name, memmap in self.data.items():
             default_value = self.defaults[name]
             if exists(default_value):
                 memmap[:] = default_value
             else:
                 memmap[:] = 0
 
-        for name, memmap in self.meta_memmaps.items():
+        for name, memmap in self.meta_data.items():
             default_value = self.meta_defaults[name]
             if exists(default_value):
                 memmap[:] = default_value
@@ -338,16 +504,8 @@ class ReplayBuffer:
         self.flush()
 
     @property
-    def data(self):
-        return self.memmaps
-
-    @property
-    def meta_data(self):
-        return self.meta_memmaps
-
-    @property
     def episode_lens(self):
-        return self.meta_memmaps['episode_lens']
+        return self.meta_data['episode_lens']
 
     def reset_(self):
         self.episode_lens[:] = 0
@@ -369,12 +527,14 @@ class ReplayBuffer:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
 
     def flush(self):
-        self.episode_lens[self.episode_index] = self.timestep_index
 
-        for memmap in self.memmaps.values():
+        if self.timestep_index > 0:
+            self.episode_lens[self.episode_index] = self.timestep_index
+
+        for memmap in self.data.values():
             memmap.flush()
 
-        for memmap in self.meta_memmaps.values():
+        for memmap in self.meta_data.values():
             memmap.flush()
 
         self._num_episodes.flush()
@@ -420,7 +580,7 @@ class ReplayBuffer:
 
         assert datapoint.shape == self.shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
 
-        self.memmaps[name][episode_index, timestep_index] = datapoint
+        self.data[name][episode_index, timestep_index] = datapoint
 
     @beartype
     def store_meta_datapoint(
@@ -441,7 +601,7 @@ class ReplayBuffer:
 
         assert datapoint.shape == self.meta_shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}'
 
-        self.meta_memmaps[name][episode_index] = datapoint
+        self.meta_data[name][episode_index] = datapoint
 
     def store(
         self,
@@ -478,12 +638,26 @@ class ReplayBuffer:
     @beartype
     def dataset(
         self,
-        fields: tuple[str, ...] | None = None
+        fields: tuple[str, ...] | None = None,
+        timestep_level: bool = False,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        **kwargs
     ) -> Dataset:
         self.flush()
+        assert len(self) > 0, 'replay buffer is empty'
 
-        dataset = ReplayDataset(self.folder, fields)
-        return dataset
+        dataset_klass = ReplayDatasetTimestep if timestep_level else ReplayDatasetTrajectory
+
+        return dataset_klass(
+            self,
+            fields = fields,
+            filter_meta = filter_meta,
+            filter_fields = filter_fields,
+            fieldname_map = fieldname_map,
+            **kwargs
+        )
 
     @beartype
     def dataloader(
@@ -491,11 +665,66 @@ class ReplayBuffer:
         batch_size,
         dataset: Dataset | None = None,
         fields: tuple[str, ...] | None = None,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        return_indices: bool = False,
+        timestep_level: bool = False,
+        to_named_tuple: tuple[str, ...] | None = None,
+        shuffle = False,
+        device: torch.device | str | None = None,
+        dataset_kwargs: dict = {},
         **kwargs
     ) -> DataLoader:
         self.flush()
+        assert len(self) > 0, 'replay buffer is empty'
+
+        # if to_named_tuple is specified, don't filter dataset fields
+        if exists(to_named_tuple):
+            assert not exists(fields), 'cannot specify both fields and to_named_tuple'
 
         if not exists(dataset):
-            dataset = self.dataset(fields)
+            dataset = self.dataset(
+                fields = fields,
+                timestep_level = timestep_level,
+                return_indices = return_indices,
+                filter_meta = filter_meta,
+                filter_fields = filter_fields,
+                fieldname_map = fieldname_map,
+                **dataset_kwargs
+            )
 
-        return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_var_time, **kwargs)
+        # choose appropriate base collation
+
+        if timestep_level:
+            base_collate_fn = None  # default collation for fixed-size timesteps
+        else:
+            # only pad data fields (trajectories), not meta fields or special fields
+            fields_to_pad = self.fieldnames
+            if exists(fieldname_map):
+                fields_to_pad = {fieldname_map.get(f, f) for f in fields_to_pad}
+
+            base_collate_fn = partial(collate_var_time, fields_to_pad = fields_to_pad)
+
+        # wrap collate to convert dict to namedtuple if requested
+
+        NamedTupleCls = None
+        if exists(to_named_tuple):
+            sanitized_fields = tuple(f.lstrip('_') if f.startswith('_') else f for f in to_named_tuple)
+            NamedTupleCls = namedtuple('Batch', sanitized_fields)
+
+        def collate_fn(data):
+            if exists(base_collate_fn):
+                batch = base_collate_fn(data)
+            else:
+                batch = default_collate(data)
+
+            if exists(to_named_tuple):
+                for field in to_named_tuple:
+                    assert field in batch, f'field `{field}` not found in batch. available fields: {list(batch.keys())}'
+
+                batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(to_named_tuple, sanitized_fields)})
+
+            return tree_map_to_device(batch, device)
+
+        return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_fn, shuffle = shuffle, **kwargs)

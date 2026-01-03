@@ -45,21 +45,36 @@ for _ in range(4):
 
 # rehydrate from disk
 
-buffer_rehydrated = ReplayBuffer.from_config('./replay_data')
+buffer_rehydrated = ReplayBuffer.from_folder('./replay_data')
 assert buffer_rehydrated.num_episodes == 4
 
-# train 2 episodes batch size
+# train 2 episodes at a time
 
-dataloader = buffer.dataloader(batch_size = 2)
+dataloader = buffer.dataloader(
+    batch_size = 2,
+    to_named_tuple = ('state', 'action', 'reward', 'task_id', '_lens')
+)
 
-for batch in dataloader:
-    state = batch['state']    # (2, 100, 3, 16, 16)
-    action = batch['action']  # (2, 100)
-    reward = batch['reward']  # (2, 100)
-    lens = batch['_lens']     # (2,)
+for state, action, reward, task_id, lens in dataloader:
+    assert state.shape   == (2, 100, 3, 16, 16)
+    assert action.shape  == (2, 100, 2)
+    assert reward.shape  == (2, 100)
+    assert task_id.shape == (2,)
+    assert lens.shape    == (2,)
 
-    assert state.shape  == (2, 100, 3, 16, 16)
-    assert action.shape == (2, 100, 2)
-    assert reward.shape == (2, 100)
-    assert lens.shape   == (2,)
+# for loading per timestep
+
+dataloader = buffer.dataloader(
+    batch_size = 8,
+    filter_meta = dict(
+        task_id = 1
+    ),
+    to_named_tuple = ('state', 'action'),
+    timestep_level = True,
+    drop_last = True
+)
+
+for state, action in dataloader:
+    assert state.shape == (8, 3, 16, 16)
+    assert action.shape == (8, 2)
 ```
