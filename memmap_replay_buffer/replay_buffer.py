@@ -219,6 +219,7 @@ class ReplayDatasetTimestep(Dataset):
         fields: tuple[str, ...] | None = None,
         fieldname_map: dict[str, str] | None = None,
         return_indices: bool = False,
+        include_metadata: bool = True,
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
         **kwargs
@@ -226,6 +227,13 @@ class ReplayDatasetTimestep(Dataset):
         self.replay_buffer = replay_buffer
         self.return_indices = return_indices
         self.fieldname_map = default(fieldname_map, {})
+
+        self.include_metadata = include_metadata
+
+        if include_metadata:
+            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k != 'episode_lens'}
+        else:
+            self.meta_data = {}
 
         episode_ids = arange(replay_buffer.max_episodes)
         episode_lens = from_numpy(replay_buffer.episode_lens)
@@ -291,6 +299,12 @@ class ReplayDatasetTimestep(Dataset):
             data = self.replay_buffer.data[field]
             model_kwarg_name = self.fieldname_map.get(field, field)
             step_data[model_kwarg_name] = from_numpy(data[episode_id, timestep_index].copy())
+
+        # add meta fields (without time dimension)
+
+        for field, memmap in self.meta_data.items():
+            mapped_name = self.fieldname_map.get(field, field)
+            step_data[mapped_name] = from_numpy(memmap[episode_id].copy())
 
         if self.return_indices:
             step_data['_indices'] = self.timepoints[idx]
