@@ -72,12 +72,13 @@ dataloader = buffer.dataloader(
     filter_meta = dict(
         task_id = 1
     ),
-    to_named_tuple = ('state', 'action'),
+    to_named_tuple = ('state', 'action', 'task_id'),
     timestep_level = True,
     drop_last = True
 )
 
-for state, action in dataloader:
-    assert state.shape == (8, 3, 16, 16)
-    assert action.shape == (8, 2)
+for state, action, task_id in dataloader:
+    assert state.shape   == (8, 3, 16, 16)
+    assert action.shape  == (8, 2)
+    assert task_id.shape == (8,)
 ```
