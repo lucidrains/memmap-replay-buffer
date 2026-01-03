@@ -649,6 +649,26 @@ class ReplayBuffer:
 
         return self.memory_namedtuple(**store_data)
 
+    def get_all_data(self):
+        self.flush()
+
+        n = self.num_episodes
+
+        if n == 0:
+            return dict()
+
+        max_len = self.episode_lens[:n].max()
+
+        all_data = dict()
+
+        for name, memmap in self.data.items():
+            all_data[name] = from_numpy(memmap[:n, :max_len].copy())
+
+        for name, memmap in self.meta_data.items():
+            all_data[name] = from_numpy(memmap[:n].copy())
+
+        return all_data
+
     @beartype
     def dataset(
         self,
