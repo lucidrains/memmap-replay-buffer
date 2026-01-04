@@ -528,8 +528,13 @@ class ReplayBuffer:
         self.timestep_index = 0
 
     def advance_episode(self):
-        if not self.circular and self.num_episodes >= self.max_episodes:
-            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
+
+        # if episode length is 0, do not advance
+
+        if self.timestep_index == 0:
+            return
+
+        assert self.circular or self.num_episodes < self.max_episodes, f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.'
 
         self.episode_lens[self.episode_index] = self.timestep_index
 
