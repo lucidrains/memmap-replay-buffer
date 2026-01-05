@@ -48,3 +48,20 @@ def test_replay():
     dataloader = replay_buffer.dataloader(batch_size = 3)
 
     assert next(iter(dataloader))['state'].shape[0] == 3
+
+def test_read_only():
+    from memmap_replay_buffer import ReplayBuffer
+
+    buffer = ReplayBuffer(
+        './test_read_only_data',
+        max_episodes = 10,
+        max_timesteps = 10,
+        fields = dict(state = 'float'),
+        read_only = True
+    )
+
+    with pytest.raises(AssertionError):
+        buffer.store(state = 1.0)
+
+    with pytest.raises(AssertionError):
+        buffer.clear()

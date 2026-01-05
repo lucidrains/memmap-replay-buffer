@@ -5,7 +5,7 @@ from beartype.door import is_bearable
 from beartype.typing import Literal
 
 import pickle
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from shutil import rmtree
 from contextlib import contextmanager
@@ -53,6 +53,9 @@ def xnor(x, y):
 def is_empty(t):
     return t.numel() == 0
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def from_numpy(arr: ndarray):
     if np.isscalar(arr) or arr.ndim == 0:
         arr = np.array(arr)
@@ -75,6 +78,13 @@ def tree_map_to_device(batch, device):
     if not exists(device):
         return batch
     return tree_map(lambda t: t.to(device) if is_tensor(t) else t, batch)
+
+def can_write(fn):
+    @wraps(fn)
+    def inner(self, *args, **kwargs):
+        assert not self.read_only, f'cannot call `{fn.__name__}` in read-only mode'
+        return fn(self, *args, **kwargs)
+    return inner
 
 # data
 
@@ -327,8 +337,11 @@ class ReplayBuffer:
         fields: dict[str, FieldInfo],
         meta_fields: dict[str, FieldInfo] = dict(),
         circular = False,
-        overwrite = True
+        overwrite = True,
+        read_only = False,
+        flush_every_store_step: int = 1
     ):
+        self.read_only = read_only
 
         # folder for data
 
@@ -456,8 +469,15 @@ class ReplayBuffer:
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
+        # how often to flush for store
+
+        assert flush_every_store_step > 0
+
+        self.store_step = 0
+        self.flush_every_store_step = flush_every_store_step
+
     @classmethod
-    def from_folder(cls, folder: str | Path):
+    def from_folder(cls, folder: str | Path, read_only: bool = False):
         if isinstance(folder, str):
             folder = Path(folder)
 
@@ -467,7 +487,7 @@ class ReplayBuffer:
         with open(str(config_path), 'rb') as f:
             config = pickle.load(f)
 
-        return cls(folder = folder, overwrite = False, **config)
+        return cls(folder = folder, overwrite = False, read_only = read_only, **config)
 
     @property
     def num_episodes(self):
@@ -499,6 +519,7 @@ class ReplayBuffer:
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
 
+    @can_write
     def clear(self):
         for name, memmap in self.data.items():
             default_value = self.defaults[name]
@@ -521,12 +542,14 @@ class ReplayBuffer:
     def episode_lens(self):
         return self.meta_data['episode_lens']
 
+    @can_write
     def reset_(self):
         self.episode_lens[:] = 0
         self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
 
+    @can_write
     def advance_episode(self):
 
         # if episode length is 0, do not advance
@@ -545,6 +568,7 @@ class ReplayBuffer:
         if self.circular:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
 
+    @can_write
     def flush(self):
 
         if self.timestep_index > 0:
@@ -560,8 +584,10 @@ class ReplayBuffer:
         self._episode_index.flush()
         self._timestep_index.flush()
 
+    @can_write
     @contextmanager
     def one_episode(self, **meta_data):
+
         if not self.circular and self.num_episodes >= self.max_episodes:
             raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
@@ -578,6 +604,7 @@ class ReplayBuffer:
         self.flush()
         self.advance_episode()
 
+    @can_write
     @beartype
     def store_datapoint(
         self,
@@ -586,6 +613,7 @@ class ReplayBuffer:
         name: str,
         datapoint: PrimitiveType | Tensor | ndarray
     ):
+
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
 
@@ -601,6 +629,7 @@ class ReplayBuffer:
 
         self.data[name][episode_index, timestep_index] = datapoint
 
+    @can_write
     @beartype
     def store_meta_datapoint(
         self,
@@ -608,6 +637,7 @@ class ReplayBuffer:
         name: str,
         datapoint: PrimitiveType | Tensor | ndarray
     ):
+
         assert 0 <= episode_index < self.max_episodes
 
         if is_tensor(datapoint):
@@ -622,10 +652,12 @@ class ReplayBuffer:
 
         self.meta_data[name][episode_index] = datapoint
 
+    @can_write
     def store(
         self,
         **data
     ):
+
         if self.timestep_index >= self.max_timesteps:
             raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
 
@@ -651,8 +683,15 @@ class ReplayBuffer:
             self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
         self.timestep_index += 1
+        self.store_step += 1
+
+        self.maybe_flush()
 
         return self.memory_namedtuple(**store_data)
+
+    def maybe_flush(self):
+        if divisible_by(self.store_step, self.flush_every_store_step):
+            self.flush()
 
     def get_all_data(
         self,
