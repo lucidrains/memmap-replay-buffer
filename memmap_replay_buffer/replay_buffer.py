@@ -471,9 +471,10 @@ class ReplayBuffer:
 
         # how often to flush for store
 
-        assert flush_every_store_step > 0
+        assert flush_every_store_step >= 0
 
         self.store_step = 0
+        self.should_flush = flush_every_store_step > 0
         self.flush_every_store_step = flush_every_store_step
 
     @classmethod
@@ -685,13 +686,10 @@ class ReplayBuffer:
         self.timestep_index += 1
         self.store_step += 1
 
-        self.maybe_flush()
+        if self.should_flush and divisible_by(self.store_step, self.flush_every_store_step):
+            self.flush()
 
         return self.memory_namedtuple(**store_data)
-
-    def maybe_flush(self):
-        if divisible_by(self.store_step, self.flush_every_store_step):
-            self.flush()
 
     def get_all_data(
         self,
