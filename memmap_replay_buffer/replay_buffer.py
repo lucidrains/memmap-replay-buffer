@@ -551,23 +551,97 @@ class ReplayBuffer:
         self.timestep_index = 0
 
     @can_write
-    def advance_episode(self):
+    def advance_episode(self, batch_size = 1):
 
-        # if episode length is 0, do not advance
+        # if episode length is 0, and not batching, do not advance
 
-        if self.timestep_index == 0:
+        if self.timestep_index == 0 and batch_size == 1:
             return
 
-        assert self.circular or self.num_episodes < self.max_episodes, f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.'
+        assert self.circular or self.num_episodes + batch_size <= self.max_episodes, f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.'
 
-        self.episode_lens[self.episode_index] = self.timestep_index
+        indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
-        self.episode_index = (self.episode_index + 1) % self.max_episodes
+        self.episode_lens[indices] = self.timestep_index
+
+        self.episode_index = (self.episode_index + batch_size) % self.max_episodes
         self.timestep_index = 0
-        self.num_episodes += 1
+        self.num_episodes += batch_size
 
         if self.circular:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
+
+    @can_write
+    @beartype
+    def _store_batch(
+        self,
+        data: dict[str, Tensor | ndarray | list | tuple],
+        is_meta = False
+    ):
+        assert len(data) > 0, f'No data provided to {"store_meta_batch" if is_meta else "store_batch"}'
+
+        fieldnames = self.meta_fieldnames if is_meta else self.fieldnames
+        assert set(data.keys()).issubset(fieldnames), f'invalid {"meta " if is_meta else ""}field names {set(data.keys()) - fieldnames} - must be a subset of {fieldnames}'
+
+        # get batch size
+
+        batch_size = None
+
+        for key, value in data.items():
+            if isinstance(value, (list, tuple)):
+                value = tensor(value)
+                data[key] = value
+
+            curr_batch_size = value.shape[0]
+
+            if not exists(batch_size):
+                batch_size = curr_batch_size
+
+            assert batch_size == curr_batch_size, f'All data in batch must have the same batch size. Field {key} has batch size {curr_batch_size} while previous fields had {batch_size}.'
+
+        assert exists(batch_size), 'Could not determine batch size from data'
+
+        # handle non-circular buffer constraints
+
+        if not self.circular:
+            remaining_episodes = self.max_episodes - self.num_episodes
+
+            if remaining_episodes <= 0:
+                raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
+
+            if remaining_episodes < batch_size:
+                # slice data before inserting
+                data = {k: v[:remaining_episodes] for k, v in data.items()}
+                batch_size = remaining_episodes
+
+        # compute row indices
+
+        indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+
+        # store data
+
+        for name, values in data.items():
+            if is_meta:
+                self.store_batch_meta_datapoint(indices, name, values)
+            else:
+                self.store_batch_datapoint(indices, self.timestep_index, name, values)
+
+        # update state
+
+        if not is_meta:
+            self.episode_lens[indices] = self.timestep_index + 1
+            self.timestep_index += 1
+
+        if self.should_flush:
+            self.flush()
+
+    @can_write
+    def store_batch(self, **data):
+        return self._store_batch(data, is_meta = False)
+
+    @can_write
+    def store_meta_batch(self, **data):
+        return self._store_batch(data, is_meta = True)
 
     @can_write
     def flush(self):
@@ -606,7 +680,21 @@ class ReplayBuffer:
         self.advance_episode()
 
     @can_write
-    @beartype
+    @contextmanager
+    def batched_episode(self, batch_size, **meta_batch):
+
+        if not self.circular and self.num_episodes + batch_size > self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
+
+        if len(meta_batch) > 0:
+            self.store_meta_batch(**meta_batch)
+
+        yield
+
+        self.flush()
+        self.advance_episode(batch_size = batch_size)
+
+    @can_write
     def store_datapoint(
         self,
         episode_index: int,
@@ -631,7 +719,6 @@ class ReplayBuffer:
         self.data[name][episode_index, timestep_index] = datapoint
 
     @can_write
-    @beartype
     def store_meta_datapoint(
         self,
         episode_index: int,
@@ -652,6 +739,35 @@ class ReplayBuffer:
         assert datapoint.shape == self.meta_shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}'
 
         self.meta_data[name][episode_index] = datapoint
+
+    @can_write
+    def store_batch_datapoint(
+        self,
+        episode_indices: ndarray,
+        timestep_index: int,
+        name: str,
+        datapoints: Tensor | ndarray
+    ):
+        if is_tensor(datapoints):
+            datapoints = datapoints.detach().cpu().numpy()
+
+        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+
+        self.data[name][episode_indices, timestep_index] = datapoints
+
+    @can_write
+    def store_batch_meta_datapoint(
+        self,
+        episode_indices: ndarray,
+        name: str,
+        datapoints: Tensor | ndarray
+    ):
+        if is_tensor(datapoints):
+            datapoints = datapoints.detach().cpu().numpy()
+
+        assert name in self.meta_fieldnames, f'invalid field name {name} - must be one of {self.meta_fieldnames}'
+
+        self.meta_data[name][episode_indices] = datapoints
 
     @can_write
     def store(
