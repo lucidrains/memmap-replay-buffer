@@ -3,7 +3,7 @@ import h5py
 import pickle
 import numpy as np
 from pathlib import Path
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from contextlib import contextmanager
 
 from beartype import beartype
@@ -529,6 +529,53 @@ class ReplayBufferH5PY:
             fieldname_map = fieldname_map,
             **kwargs
         )
+
+    def get_buffered_storer(self, flush_freq: int):
+        storage = defaultdict(list)
+
+        def buffered_storer(force_flush = False, **data):
+            assert not self.read_only, 'cannot write to read-only buffer'
+
+            for key, value in data.items():
+                assert key in self.fieldnames or key in self.meta_fieldnames, f"Field {key} not found in buffer fields"
+                storage[key].append(value)
+
+            if not (storage and (force_flush or len(next(iter(storage.values()))) >= flush_freq)):
+                return
+
+            # validation check for all storage lists having same length
+            batch_size = len(next(iter(storage.values())))
+
+            for k, v in storage.items():
+                assert len(v) == batch_size, f"Field {k} has different number of episodes in buffer ({len(v)}, expected {batch_size})"
+
+            batch_data = {k: np.stack(v) for k, v in storage.items()}
+
+            self._store_episodes_batch(batch_data)
+
+            storage.clear()
+            self.flush()
+
+        return buffered_storer
+
+    @can_write
+    def _store_episodes_batch(self, data: dict[str, np.ndarray]):
+        batch_size = next(iter(data.values())).shape[0]
+
+        assert self.circular or self.num_episodes + batch_size <= self.max_episodes, "Buffer full"
+        indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+
+        for name, values in data.items():
+            if name in self.fieldnames:
+                self.data[name][indices] = values
+            elif name in self.meta_fieldnames:
+                self.meta_data[name][indices] = values
+
+        self.episode_index = (self.episode_index + batch_size) % self.max_episodes
+        self.num_episodes += batch_size
+
+        if self.circular:
+            self.num_episodes = min(self.num_episodes, self.max_episodes)
 
     def __del__(self):
         if hasattr(self, 'file'):
