@@ -1,6 +1,7 @@
 from __future__ import annotations
 import h5py
 import pickle
+import warnings
 import numpy as np
 from pathlib import Path
 from collections import namedtuple, defaultdict
@@ -452,7 +453,6 @@ class ReplayBufferH5PY:
             datapoints = datapoints.detach().cpu().numpy()
 
         self.meta_data[name][episode_indices] = datapoints
-
     @can_write
     def store(self, **data):
         if self.timestep_index >= self.max_timesteps:
@@ -484,6 +484,45 @@ class ReplayBufferH5PY:
             self.flush()
 
         return self.memory_namedtuple(**store_data)
+
+    @can_write
+    def store_episode(
+        self,
+        **data
+    ):
+        if self.timestep_index != 0:
+            warnings.warn(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
+
+        assert len(data) > 0, 'No data provided to `store_episode`'
+
+        # validate all fields have same time dimension
+
+        time_dim = None
+
+        for name, value in data.items():
+            if is_tensor(value):
+                value = value.detach().cpu().numpy()
+
+            if isinstance(value, (list, tuple)):
+                value = np.array(value)
+
+            assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+
+            curr_time_dim = value.shape[0]
+
+            if not exists(time_dim):
+                time_dim = curr_time_dim
+
+            assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
+            assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+
+            if time_dim > self.max_timesteps:
+                raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
+            self.data[name][self.episode_index, :time_dim] = value
+
+        self.timestep_index = time_dim
+        self.advance_episode()
 
     def get_all_data(self, fields = None, meta_fields = None):
         self.flush()
