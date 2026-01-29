@@ -48,6 +48,16 @@ def default(v, d):
 def first(arr):
     return arr[0]
 
+def cast_to_target_shape(value, target_shape, is_time_varying = False):
+    input_shape = value.shape[1:] if is_time_varying else value.shape
+
+    if target_shape == () and input_shape == (1,):
+        return value.squeeze(-1)
+    elif target_shape == (1,) and input_shape == ():
+        return np.expand_dims(value, -1)
+    
+    return value
+
 def xnor(x, y):
     return not (x ^ y)
 
@@ -58,8 +68,11 @@ def divisible_by(num, den):
     return (num % den) == 0
 
 def from_numpy(arr: ndarray):
-    if np.isscalar(arr) or arr.ndim == 0:
+    arr = np.asarray(arr)
+
+    if arr.ndim == 0:
         arr = np.array(arr)
+
     return torch_from_numpy(arr)
 
 def pad_at_dim(
@@ -447,6 +460,8 @@ class ReplayBuffer:
         self.defaults = dict()
         self.fieldnames = set(fields.keys())
 
+        assert self.fieldnames.isdisjoint(self.meta_fieldnames), f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}'
+
         for field_name, field_info in fields.items():
 
             dtype, shape, default_value = parse_field_info(field_info)
@@ -829,20 +844,41 @@ class ReplayBuffer:
             if isinstance(value, (list, tuple)):
                 value = np.array(value)
 
-            assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+            if np.isscalar(value):
+                value = np.array(value)
 
-            curr_time_dim = value.shape[0]
+            is_time_varying = name in self.fieldnames
+            is_meta = name in self.meta_fieldnames
 
-            if not exists(time_dim):
-                time_dim = curr_time_dim
+            assert is_time_varying or is_meta, f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}'
 
-            assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
-            assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+            if is_time_varying:
+                curr_time_dim = value.shape[0]
 
-            if time_dim > self.max_timesteps:
-                raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+                if not exists(time_dim):
+                    time_dim = curr_time_dim
 
-            self.data[name][self.episode_index, :time_dim] = value
+                assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
+                
+                # auto-squeeze/unsqueeze logic for shapes () and (1,)
+                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
+
+                assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+
+                if time_dim > self.max_timesteps:
+                    raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
+                self.data[name][self.episode_index, :time_dim] = value
+
+            elif is_meta:
+                # auto-squeeze/unsqueeze logic for shapes () and (1,)
+                target_shape = self.shapes[name] if name in self.shapes else self.meta_shapes[name]
+                value = cast_to_target_shape(value, target_shape, is_time_varying = False)
+                
+                assert value.shape == self.meta_shapes[name], f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}'
+                self.meta_data[name][self.episode_index] = value
+
+        assert exists(time_dim), 'At least one time-varying field must be provided to store_episode'
 
         self.timestep_index = time_dim
         self.advance_episode()

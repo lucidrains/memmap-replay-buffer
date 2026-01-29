@@ -3,3 +3,5 @@ from memmap_replay_buffer.replay_buffer import (
     ReplayDataset
 )
 
+from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY
+

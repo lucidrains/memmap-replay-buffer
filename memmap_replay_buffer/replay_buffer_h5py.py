@@ -7,18 +7,22 @@ from pathlib import Path
 from collections import namedtuple, defaultdict
 from contextlib import contextmanager
 
+from functools import partial
+import einx
+import beartype
 from beartype import beartype
 from beartype.door import is_bearable
 from beartype.typing import Literal
 
 import torch
-from torch import tensor, from_numpy as torch_from_numpy, stack, is_tensor, Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch import tensor, from_numpy as torch_from_numpy, stack, is_tensor, Tensor, arange
+from torch.utils.data import Dataset, DataLoader, default_collate
 
 from memmap_replay_buffer.replay_buffer import (
     exists,
     default,
     first,
+    cast_to_target_shape,
     xnor,
     is_empty,
     divisible_by,
@@ -27,7 +31,9 @@ from memmap_replay_buffer.replay_buffer import (
     ReplayDatasetTrajectory,
     ReplayDatasetTimestep,
     FieldInfo,
-    PrimitiveType
+    PrimitiveType,
+    collate_var_time,
+    tree_map_to_device
 )
 
 # h5py dataset proxy
@@ -168,6 +174,7 @@ class ReplayBufferH5PY:
         self.meta_dtypes = dict()
         self.meta_data = dict()
         self.meta_defaults = dict()
+        self.meta_defaults = dict()
         self.meta_fieldnames = set(meta_fields.keys())
 
         def parse_field_info(field_info):
@@ -221,6 +228,8 @@ class ReplayBufferH5PY:
         self.data = dict()
         self.defaults = dict()
         self.fieldnames = set(fields.keys())
+
+        assert self.fieldnames.isdisjoint(self.meta_fieldnames), f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}'
 
         for field_name, field_info in fields.items():
             dtype, shape, default_value = parse_field_info(field_info)
@@ -506,20 +515,41 @@ class ReplayBufferH5PY:
             if isinstance(value, (list, tuple)):
                 value = np.array(value)
 
-            assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+            if np.isscalar(value):
+                value = np.array(value)
 
-            curr_time_dim = value.shape[0]
+            is_time_varying = name in self.fieldnames
+            is_meta = name in self.meta_fieldnames
 
-            if not exists(time_dim):
-                time_dim = curr_time_dim
+            assert is_time_varying or is_meta, f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}'
 
-            assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
-            assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+            if is_time_varying:
+                curr_time_dim = value.shape[0]
 
-            if time_dim > self.max_timesteps:
-                raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+                if not exists(time_dim):
+                    time_dim = curr_time_dim
 
-            self.data[name][self.episode_index, :time_dim] = value
+                assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
+                
+                # auto-squeeze/unsqueeze logic for shapes () and (1,)
+                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
+
+                assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+
+                if time_dim > self.max_timesteps:
+                    raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
+                self.data[name][self.episode_index, :time_dim] = value
+
+            elif is_meta:
+                # auto-squeeze/unsqueeze logic for shapes () and (1,)
+                target_shape = self.shapes[name] if name in self.shapes else self.meta_shapes[name]
+                value = cast_to_target_shape(value, target_shape, is_time_varying = False)
+
+                assert value.shape == self.meta_shapes[name], f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}'
+                self.meta_data[name][self.episode_index] = value
+
+        assert exists(time_dim), 'At least one time-varying field must be provided to store_episode'
 
         self.timestep_index = time_dim
         self.advance_episode()
@@ -596,6 +626,84 @@ class ReplayBufferH5PY:
             self.flush()
 
         return buffered_storer
+
+    @beartype
+    def dataloader(
+        self,
+        batch_size,
+        dataset: Dataset | None = None,
+        fields: tuple[str, ...] | None = None,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        return_indices: bool = False,
+        return_mask: bool = False,
+        timestep_level: bool = False,
+        to_named_tuple: tuple[str, ...] | None = None,
+        shuffle = False,
+        device: torch.device | str | None = None,
+        dataset_kwargs: dict = {},
+        **kwargs
+    ) -> DataLoader:
+        self.flush()
+        assert len(self) > 0, 'replay buffer is empty'
+
+        # if to_named_tuple is specified, don't filter dataset fields
+        if exists(to_named_tuple):
+            assert not exists(fields), 'cannot specify both fields and to_named_tuple'
+
+        assert not (return_mask and timestep_level), 'return_mask is only supported for trajectory-level data'
+
+        if not exists(dataset):
+            dataset = self.dataset(
+                fields = fields,
+                timestep_level = timestep_level,
+                return_indices = return_indices,
+                filter_meta = filter_meta,
+                filter_fields = filter_fields,
+                fieldname_map = fieldname_map,
+                **dataset_kwargs
+            )
+
+        # choose appropriate base collation
+
+        if timestep_level:
+            base_collate_fn = None  # default collation for fixed-size timesteps
+        else:
+            # only pad data fields (trajectories), not meta fields or special fields
+            fields_to_pad = self.fieldnames
+            if exists(fieldname_map):
+                fields_to_pad = {fieldname_map.get(f, f) for f in fields_to_pad}
+
+            base_collate_fn = partial(collate_var_time, fields_to_pad = fields_to_pad)
+
+        # wrap collate to convert dict to namedtuple if requested
+
+        NamedTupleCls = None
+        if exists(to_named_tuple):
+            sanitized_fields = tuple(f.lstrip('_') if f.startswith('_') else f for f in to_named_tuple)
+            NamedTupleCls = namedtuple('Batch', sanitized_fields)
+
+        def collate_fn(data):
+            if exists(base_collate_fn):
+                batch = base_collate_fn(data)
+            else:
+                batch = default_collate(data)
+
+            if return_mask:
+                lens = batch['_lens']
+                max_len = lens.amax().item()
+                batch['_mask'] = einx.less('j, i -> i j', arange(max_len, device = lens.device), lens)
+
+            if exists(to_named_tuple):
+                for field in to_named_tuple:
+                    assert field in batch, f'field `{field}` not found in batch. available fields: {list(batch.keys())}'
+
+                batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(to_named_tuple, sanitized_fields)})
+
+            return tree_map_to_device(batch, device)
+
+        return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_fn, shuffle = shuffle, **kwargs)
 
     @can_write
     def _store_episodes_batch(self, data: dict[str, np.ndarray]):
