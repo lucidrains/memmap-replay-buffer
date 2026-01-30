@@ -705,6 +705,20 @@ class ReplayBufferH5PY:
 
         return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_fn, shuffle = shuffle, **kwargs)
 
+    def create_collector(
+        self,
+        num_groups: int,
+        fieldnames: tuple[str, ...] | None = None,
+        meta_fieldnames: tuple[str, ...] | None = None
+    ):
+        from memmap_replay_buffer.episode_collector import EpisodeCollector
+        return EpisodeCollector(
+            self,
+            num_groups,
+            fieldnames = fieldnames,
+            meta_fieldnames = meta_fieldnames
+        )
+
     @can_write
     def _store_episodes_batch(self, data: dict[str, np.ndarray]):
         batch_size = next(iter(data.values())).shape[0]
