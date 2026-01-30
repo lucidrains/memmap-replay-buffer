@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Any
 from beartype import beartype
 from beartype.door import is_bearable
 from beartype.typing import Literal
@@ -1019,3 +1019,17 @@ class ReplayBuffer:
             return tree_map_to_device(batch, device)
 
         return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_fn, shuffle = shuffle, **kwargs)
+
+    def create_collector(
+        self,
+        num_groups: int,
+        fieldnames: tuple[str, ...] | None = None,
+        meta_fieldnames: tuple[str, ...] | None = None
+    ):
+        from memmap_replay_buffer.episode_collector import EpisodeCollector
+        return EpisodeCollector(
+            self,
+            num_groups,
+            fieldnames = fieldnames,
+            meta_fieldnames = meta_fieldnames
+        )
