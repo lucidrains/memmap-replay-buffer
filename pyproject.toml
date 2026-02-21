@@ -1,6 +1,6 @@
 [project]
 name = "memmap-replay-buffer"
-version = "0.0.27"
+version = "0.0.28"
 description = "Simple Replay Buffer for RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -32,7 +32,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://pypi.org/project/memmap-replay-buffer/"
-Repository = "https://github.com/lucidrains/memmap-replay-buffer"
+Repository = "https://codeberg.org/lucidrains/memmap-replay-buffer"
 
 [project.optional-dependencies]
 examples = []
@@ -58,4 +58,13 @@ dev-dependencies = []
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["memmap_replay_buffer"]
+packages = ["memmap_replay_buffer", "tests"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/memmap_replay_buffer",
+    "/tests",
+    "/pyproject.toml",
+    "/LICENSE",
+    "/README.md"
+]

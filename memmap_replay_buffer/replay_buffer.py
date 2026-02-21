@@ -29,7 +29,7 @@ from einops import rearrange
 
 PrimitiveType = int | float | bool
 
-PrimitiveTypeStr = Literal['int', 'float', 'bool']
+PrimitiveTypeStr = Literal['int', 'float', 'bool', 'uint8']
 
 FieldInfo = (
     PrimitiveTypeStr |
@@ -422,9 +422,9 @@ class ReplayBuffer:
                 field_info = (*field_info, None)
 
             dtype_str, shape, default_value = field_info
-            assert dtype_str in {'int', 'float', 'bool'}
+            assert dtype_str in {'int', 'float', 'bool', 'uint8'}
 
-            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_, uint8 = np.uint8)[dtype_str]
 
             if isinstance(shape, int):
                 shape = (shape,)

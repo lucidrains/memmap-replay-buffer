@@ -185,7 +185,7 @@ class ReplayBufferH5PY:
                 field_info = (*field_info, None)
 
             dtype_str, shape, default_value = field_info
-            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_, uint8 = np.uint8)[dtype_str]
 
             if isinstance(shape, int):
                 shape = (shape,)
