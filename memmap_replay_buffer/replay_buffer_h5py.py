@@ -168,12 +168,15 @@ class ReplayBufferH5PY:
             meta_fields = meta_fields.copy()
             meta_fields.update(episode_lens = 'int')
 
+        if '_initted' not in meta_fields:
+            meta_fields = meta_fields.copy()
+            meta_fields.update(_initted = 'bool')
+
         # create the datasets for meta data tracks
 
         self.meta_shapes = dict()
         self.meta_dtypes = dict()
         self.meta_data = dict()
-        self.meta_defaults = dict()
         self.meta_defaults = dict()
         self.meta_fieldnames = set(meta_fields.keys())
 
@@ -208,11 +211,6 @@ class ReplayBufferH5PY:
                     compression = h5py_compression,
                     compression_opts = h5py_compression_opts
                 )
-
-                if exists(default_value):
-                    dset[:] = default_value
-                else:
-                    dset[:] = 0
             else:
                 dset = self.file[dset_name]
 
@@ -220,6 +218,8 @@ class ReplayBufferH5PY:
             self.meta_shapes[field_name] = shape
             self.meta_dtypes[field_name] = dtype
             self.meta_defaults[field_name] = default_value
+
+        self.internal_meta_fieldnames = {'episode_lens', '_initted'}
 
         # create the datasets for individual data tracks
 
@@ -247,11 +247,6 @@ class ReplayBufferH5PY:
                     compression = h5py_compression,
                     compression_opts = h5py_compression_opts
                 )
-
-                if exists(default_value):
-                    dset[:] = default_value
-                else:
-                    dset[:] = 0
             else:
                 dset = self.file[dset_name]
 
@@ -297,22 +292,19 @@ class ReplayBufferH5PY:
     def episode_lens(self):
         return self.meta_data['episode_lens']
 
+    @property
+    def _initted(self):
+        return self.meta_data['_initted']
+
     @can_write
     def clear(self):
-        for name, dset in self.data.items():
-            default_value = self.defaults[name]
-            dset[:] = default_value if exists(default_value) else 0
-
-        for name, dset in self.meta_data.items():
-            default_value = self.meta_defaults[name]
-            dset[:] = default_value if exists(default_value) else 0
-
         self.reset_()
         self.flush()
 
     @can_write
     def reset_(self):
         self.episode_lens[:] = 0
+        self._initted[:] = False
         self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
@@ -334,6 +326,36 @@ class ReplayBufferH5PY:
 
         if self.circular:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
+
+        next_indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+        self._initted[next_indices] = False
+
+    @can_write
+    def _lazy_init_episodes(self, indices: ndarray):
+        is_initted = self._initted[indices]
+
+        if np.all(is_initted):
+            return
+
+        uninit_indices = np.unique(indices[~is_initted])
+
+        # fill meta fields with defaults
+
+        for name, dset in self.meta_data.items():
+            if name in self.internal_meta_fieldnames:
+                continue
+            shape = (len(uninit_indices), *self.meta_shapes[name])
+            dtype = self.meta_dtypes[name]
+            dset[uninit_indices] = np.full(shape, default(self.meta_defaults[name], 0), dtype=dtype)
+
+        # fill data fields with defaults
+
+        for name, dset in self.data.items():
+            shape = (len(uninit_indices), self.max_timesteps, *self.shapes[name])
+            dtype = self.dtypes[name]
+            dset[uninit_indices] = np.full(shape, default(self.defaults[name], 0), dtype=dtype)
+
+        self._initted[uninit_indices] = True
 
     @can_write
     def _store_batch(self, data: dict[str, Tensor | ndarray | list | tuple], is_meta = False):
@@ -431,6 +453,7 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_datapoint(self, episode_index, timestep_index, name, datapoint):
+        self._lazy_init_episodes(np.array([episode_index]))
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -441,6 +464,7 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_meta_datapoint(self, episode_index, name, datapoint):
+        self._lazy_init_episodes(np.array([episode_index]))
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -451,6 +475,7 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_batch_datapoint(self, episode_indices, timestep_index, name, datapoints):
+        self._lazy_init_episodes(np.atleast_1d(episode_indices))
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -458,6 +483,7 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_batch_meta_datapoint(self, episode_indices, name, datapoints):
+        self._lazy_init_episodes(np.atleast_1d(episode_indices))
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -504,6 +530,8 @@ class ReplayBufferH5PY:
 
         assert len(data) > 0, 'No data provided to `store_episode`'
 
+        self._lazy_init_episodes(np.array([self.episode_index]))
+
         # validate all fields have same time dimension
 
         time_dim = None
@@ -530,7 +558,7 @@ class ReplayBufferH5PY:
                     time_dim = curr_time_dim
 
                 assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
-                
+
                 # auto-squeeze/unsqueeze logic for shapes () and (1,)
                 value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
 
@@ -566,7 +594,11 @@ class ReplayBufferH5PY:
         all_data = dict()
 
         data_fields = default(fields, self.fieldnames)
-        meta_data_fields = default(meta_fields, self.meta_fieldnames)
+
+        if not exists(meta_fields):
+            meta_data_fields = tuple(f for f in self.meta_fieldnames if f != '_initted')
+        else:
+            meta_data_fields = meta_fields
 
         for name in data_fields:
             all_data[name] = from_numpy(self.data[name][:n, :max_len])
@@ -725,6 +757,8 @@ class ReplayBufferH5PY:
 
         assert self.circular or self.num_episodes + batch_size <= self.max_episodes, "Buffer full"
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+
+        self._lazy_init_episodes(indices)
 
         for name, values in data.items():
             if name in self.fieldnames:

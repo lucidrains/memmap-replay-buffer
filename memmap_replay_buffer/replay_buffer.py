@@ -55,7 +55,7 @@ def cast_to_target_shape(value, target_shape, is_time_varying = False):
         return value.squeeze(-1)
     elif target_shape == (1,) and input_shape == ():
         return np.expand_dims(value, -1)
-    
+
     return value
 
 def xnor(x, y):
@@ -116,9 +116,9 @@ def collate_var_time(data, fields_to_pad = None):
 
         # only pad fields that are explicitly requested as trajectories
         # and have more than 0 dimensions
-        
+
         is_trajectory = exists(fields_to_pad) and key in fields_to_pad
-        
+
         if is_trajectory and tensors[0].ndim > 0:
 
             times = [t.shape[0] for t in tensors]
@@ -131,7 +131,7 @@ def collate_var_time(data, fields_to_pad = None):
 
 class ReplayDatasetTrajectory(Dataset):
     """Dataset that returns full episodes (variable length trajectories)."""
-    
+
     def __init__(
         self,
         replay_buffer: str | Path | ReplayBuffer,
@@ -154,7 +154,7 @@ class ReplayDatasetTrajectory(Dataset):
         self.fieldname_map = default(fieldname_map, {})
 
         # start with non-zero length episodes
-        
+
         valid_mask = self.replay_buffer.episode_lens > 0
 
         # apply meta field filters
@@ -202,7 +202,7 @@ class ReplayDatasetTrajectory(Dataset):
         self.include_metadata = include_metadata
 
         if include_metadata:
-            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k != 'episode_lens'}
+            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames}
         else:
             self.meta_data = {}
 
@@ -236,7 +236,7 @@ class ReplayDatasetTrajectory(Dataset):
 
 class ReplayDatasetTimestep(Dataset):
     """Dataset that returns individual timesteps."""
-    
+
     def __init__(
         self,
         replay_buffer: 'ReplayBuffer',
@@ -255,7 +255,7 @@ class ReplayDatasetTimestep(Dataset):
         self.include_metadata = include_metadata
 
         if include_metadata:
-            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k != 'episode_lens'}
+            self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames}
         else:
             self.meta_data = {}
 
@@ -265,7 +265,7 @@ class ReplayDatasetTimestep(Dataset):
         max_episode_len = episode_lens.amax().item()
 
         # start with non-zero length episodes
-        
+
         valid_mask = episode_lens > 0
 
         # apply meta field filters (episode-level)
@@ -361,7 +361,7 @@ class ReplayBuffer:
 
         if not isinstance(folder, Path):
             folder = Path(folder)
-            
+
         folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
@@ -406,6 +406,10 @@ class ReplayBuffer:
             meta_fields = meta_fields.copy()
             meta_fields.update(episode_lens = 'int')
 
+        if '_initted' not in meta_fields:
+            meta_fields = meta_fields.copy()
+            meta_fields.update(_initted = 'bool')
+
         # create the memmap for meta data tracks
 
         self.meta_shapes = dict()
@@ -441,16 +445,12 @@ class ReplayBuffer:
 
             memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, *shape))
 
-            if overwrite:
-                if exists(default_value):
-                    memmap[:] = default_value
-                else:
-                    memmap[:] = 0
-
             self.meta_data[field_name] = memmap
             self.meta_shapes[field_name] = shape
             self.meta_dtypes[field_name] = dtype
             self.meta_defaults[field_name] = default_value
+
+        self.internal_meta_fieldnames = {'episode_lens', '_initted'}
 
         # create the memmap for individual data tracks
 
@@ -471,12 +471,6 @@ class ReplayBuffer:
             filepath = folder / f'{field_name}.data.npy'
 
             memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
-
-            if overwrite:
-                if exists(default_value):
-                    memmap[:] = default_value
-                else:
-                    memmap[:] = 0
 
             self.data[field_name] = memmap
             self.shapes[field_name] = shape
@@ -538,20 +532,6 @@ class ReplayBuffer:
 
     @can_write
     def clear(self):
-        for name, memmap in self.data.items():
-            default_value = self.defaults[name]
-            if exists(default_value):
-                memmap[:] = default_value
-            else:
-                memmap[:] = 0
-
-        for name, memmap in self.meta_data.items():
-            default_value = self.meta_defaults[name]
-            if exists(default_value):
-                memmap[:] = default_value
-            else:
-                memmap[:] = 0
-
         self.reset_()
         self.flush()
 
@@ -559,9 +539,14 @@ class ReplayBuffer:
     def episode_lens(self):
         return self.meta_data['episode_lens']
 
+    @property
+    def _initted(self):
+        return self.meta_data['_initted']
+
     @can_write
     def reset_(self):
         self.episode_lens[:] = 0
+        self._initted[:] = False
         self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
@@ -586,6 +571,33 @@ class ReplayBuffer:
 
         if self.circular:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
+
+        # mark next newly active episode(s) as uninitialized so they lazily overwrite old data with defaults
+        next_indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+        self._initted[next_indices] = False
+
+    @can_write
+    def _lazy_init_episodes(self, indices: ndarray):
+        is_initted = self._initted[indices]
+
+        if is_initted.all():
+            return
+
+        uninit_indices = np.unique(indices[~is_initted])
+
+        # fill meta fields with defaults
+
+        for name, memmap in self.meta_data.items():
+            if name in self.internal_meta_fieldnames:
+                continue
+            memmap[uninit_indices] = default(self.meta_defaults[name], 0)
+
+        # fill data fields with defaults
+
+        for name, memmap in self.data.items():
+            memmap[uninit_indices] = default(self.defaults[name], 0)
+
+        self._initted[uninit_indices] = True
 
     @can_write
     @beartype
@@ -722,6 +734,8 @@ class ReplayBuffer:
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
 
+        self._lazy_init_episodes(np.array([episode_index]))
+
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -744,6 +758,8 @@ class ReplayBuffer:
 
         assert 0 <= episode_index < self.max_episodes
 
+        self._lazy_init_episodes(np.array([episode_index]))
+
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -764,6 +780,8 @@ class ReplayBuffer:
         name: str,
         datapoints: Tensor | ndarray
     ):
+        self._lazy_init_episodes(np.atleast_1d(episode_indices))
+
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -778,6 +796,8 @@ class ReplayBuffer:
         name: str,
         datapoints: Tensor | ndarray
     ):
+        self._lazy_init_episodes(np.atleast_1d(episode_indices))
+
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -833,6 +853,9 @@ class ReplayBuffer:
 
         assert len(data) > 0, 'No data provided to `store_episode`'
 
+        # lazy init uninitialized episode
+        self._lazy_init_episodes(np.array([self.episode_index]))
+
         # validate all fields have same time dimension
 
         time_dim = None
@@ -859,7 +882,7 @@ class ReplayBuffer:
                     time_dim = curr_time_dim
 
                 assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
-                
+
                 # auto-squeeze/unsqueeze logic for shapes () and (1,)
                 value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
 
@@ -874,7 +897,7 @@ class ReplayBuffer:
                 # auto-squeeze/unsqueeze logic for shapes () and (1,)
                 target_shape = self.shapes[name] if name in self.shapes else self.meta_shapes[name]
                 value = cast_to_target_shape(value, target_shape, is_time_varying = False)
-                
+
                 assert value.shape == self.meta_shapes[name], f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}'
                 self.meta_data[name][self.episode_index] = value
 
@@ -903,7 +926,7 @@ class ReplayBuffer:
 
         if not exists(fields) and not exists(meta_fields):
             data_fields = self.fieldnames
-            meta_data_fields = self.meta_fieldnames
+            meta_data_fields = tuple(f for f in self.meta_fieldnames if f != '_initted')
         else:
             data_fields = default(fields, ())
             meta_data_fields = default(meta_fields, ())
