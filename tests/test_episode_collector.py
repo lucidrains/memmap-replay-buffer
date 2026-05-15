@@ -14,7 +14,7 @@ def test_episode_collector(BufferClass):
         obs = ('float', (512,)),
         actions = 'int'
     )
-    
+
     meta_fields = dict(
         rewards = 'float'
     )

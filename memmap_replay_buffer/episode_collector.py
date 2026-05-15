@@ -24,20 +24,20 @@ def default(v, d):
 def is_group_batched(value, num_groups):
     if is_tensor(value) or isinstance(value, ndarray):
         return value.shape[0] == num_groups
-    
+
     if isinstance(value, (list, tuple)):
         return len(value) == num_groups
-    
+
     return False
 
 def combine_trajectory(values):
     first = values[0]
     if is_tensor(first):
         return cat(values, dim = 0)
-    
+
     if isinstance(first, ndarray):
         return np.concatenate(values, axis = 0)
-    
+
     return np.array(values)
 
 class EpisodeCollector:
@@ -80,7 +80,7 @@ class EpisodeCollector:
     def store(self, **meta_data):
         for i in range(self.num_groups):
             group_data = self.episode_data[i]
-            
+
             store_kwargs = dict()
 
             # Handle collected data

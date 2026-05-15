@@ -59,7 +59,7 @@ def test_get_all_data_subselection():
     assert 'action' in selected_both
     assert 'task_id' in selected_both
     assert 'episode_lens' not in selected_both
-    
+
     shutil.rmtree(folder)
 
 if __name__ == "__main__":

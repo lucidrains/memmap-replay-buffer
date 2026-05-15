@@ -29,14 +29,14 @@ def test_scalar_shape_flexibility(tmp_path, buffer_class):
     # - one_dim_meta (expecting (1,)) receives () -> should unsqueeze
 
     buffer.store_episode(
-        scalar_field = np.random.randn(5, 1), 
+        scalar_field = np.random.randn(5, 1),
         one_dim_field = np.random.randn(5),
         scalar_meta = np.random.randn(1),
         one_dim_meta = np.random.randn()
     )
 
     assert buffer.num_episodes == 2
-    
+
     data = buffer.get_all_data()
     assert data['scalar_field'].shape == (2, 5)
     assert data['one_dim_field'].shape == (2, 5, 1)

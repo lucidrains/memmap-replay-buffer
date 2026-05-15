@@ -129,7 +129,7 @@ def test_store_batch():
     # Then store_batch state ones(2) at ep 0, 1.
     # Then advance_episode(3) -> episode_index is 3.
     # Then store_batch zeros(2) at ep 3, 4.
-    
+
     # Check data storage
     assert torch.all(data['state'][:2, 0] == 1)
     assert torch.all(data['state'][3:5, 2] == 0)
@@ -190,7 +190,7 @@ def test_store_batch():
 
     assert buffer.num_episodes == 3
     assert buffer.episode_index == 3
-    
+
     data = buffer.get_all_data()
     assert torch.all(data['label'][:3] == torch.tensor([10, 20, 30]))
     assert torch.all(data['state'][:3, 0] == 1)
@@ -219,7 +219,7 @@ def test_consistency():
 
     # 1. Sequential Buffer
     buffer_seq = ReplayBuffer(folder_seq, max_episodes, max_timesteps, fields, circular = True)
-    
+
     for i in range(total_episodes):
         with buffer_seq.one_episode():
             for t in range(max_timesteps):
@@ -229,12 +229,12 @@ def test_consistency():
     buffer_batch = ReplayBuffer(folder_batch, max_episodes, max_timesteps, fields, circular = True)
 
     # store 2 batches of 3, then one batch of 2
-    
+
     # Batch 1 (eps 0, 1, 2)
     with buffer_batch.batched_episode(batch_size = 3):
         for t in range(max_timesteps):
             buffer_batch.store_batch(
-                state = torch.tensor([float(0), float(1), float(2)]), 
+                state = torch.tensor([float(0), float(1), float(2)]),
                 action = torch.tensor([0, 1, 2])
             )
 
@@ -242,7 +242,7 @@ def test_consistency():
     with buffer_batch.batched_episode(batch_size = 3):
         for t in range(max_timesteps):
             buffer_batch.store_batch(
-                state = torch.tensor([float(3), float(4), float(5)]), 
+                state = torch.tensor([float(3), float(4), float(5)]),
                 action = torch.tensor([3, 4, 5])
             )
 
@@ -250,7 +250,7 @@ def test_consistency():
     with buffer_batch.batched_episode(batch_size = 2):
         for t in range(max_timesteps):
             buffer_batch.store_batch(
-                state = torch.tensor([float(6), float(7)]), 
+                state = torch.tensor([float(6), float(7)]),
                 action = torch.tensor([6, 7])
             )
 
@@ -260,7 +260,7 @@ def test_consistency():
 
     for key in data_seq:
         assert torch.all(data_seq[key] == data_batch[key]), f'Mismatched data for {key}'
-    
+
     assert np.all(buffer_seq.episode_lens == buffer_batch.episode_lens)
     assert buffer_seq.episode_index == buffer_batch.episode_index
     assert buffer_seq.num_episodes == buffer_batch.num_episodes
