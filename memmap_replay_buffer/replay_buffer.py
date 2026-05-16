@@ -979,6 +979,7 @@ class ReplayBuffer:
     ) -> Dataset:
         self.flush()
         assert len(self) > 0, 'replay buffer is empty'
+        assert not (exists(n_steps) and timestep_level), 'cannot specify both n_steps and timestep_level'
 
         if exists(n_steps):
             return ReplayDatasetNStep(
@@ -1041,6 +1042,7 @@ class ReplayBuffer:
             assert not exists(fields), 'cannot specify both fields and to_named_tuple'
 
         assert not (return_mask and (timestep_level or exists(n_steps))), 'return_mask is only supported for trajectory-level data'
+        assert not (exists(n_steps) and timestep_level), 'cannot specify both n_steps and timestep_level'
 
         if not exists(dataset):
             dataset = self.dataset(
