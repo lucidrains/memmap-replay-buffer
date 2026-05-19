@@ -928,6 +928,63 @@ class ReplayBuffer:
         self.timestep_index = time_dim
         self.advance_episode()
 
+    @can_write
+    @beartype
+    def update(
+        self,
+        indices: int | list | ndarray | slice | None = None,
+        **data
+    ):
+        assert len(data) > 0
+
+        # normalize indices
+
+        if not exists(indices):
+            indices = np.where(self.episode_lens > 0)[0]
+            scalar_index = False
+        elif isinstance(indices, slice):
+            indices = np.arange(*indices.indices(self.max_episodes))
+            scalar_index = False
+        elif np.isscalar(indices):
+            indices = np.array([indices])
+            scalar_index = True
+        else:
+            indices = np.atleast_1d(np.asarray(indices))
+            scalar_index = False
+
+        self._lazy_init_episodes(indices)
+
+        for name, value in data.items():
+            if is_tensor(value):
+                value = value.detach().cpu().numpy()
+
+            if isinstance(value, (list, tuple)):
+                value = np.array(value)
+
+            if np.isscalar(value):
+                value = np.array(value)
+
+            if scalar_index:
+                value = np.expand_dims(value, 0)
+
+            is_time_varying = name in self.fieldnames
+            is_meta = name in self.meta_fieldnames
+
+            assert is_time_varying or is_meta, f'invalid field name `{name}`'
+
+            if is_time_varying:
+                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
+                time_dim = value.shape[1]
+                self.data[name][indices, :time_dim] = value
+
+            elif is_meta:
+                target_shape = self.meta_shapes[name]
+                value = cast_to_target_shape(value, target_shape, is_time_varying = False)
+                self.meta_data[name][indices] = value
+
+        if self.should_flush:
+            self.flush()
+
     def get_all_data(
         self,
         fields: tuple[str, ...] | None = None,

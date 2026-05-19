@@ -268,3 +268,60 @@ def test_consistency():
     # cleanup
     shutil.rmtree(folder_seq)
     shutil.rmtree(folder_batch)
+
+def test_update():
+    from memmap_replay_buffer import ReplayBuffer
+    import shutil
+    import torch
+    import numpy as np
+
+    folder = './test_update'
+    if shutil.os.path.exists(folder):
+        shutil.rmtree(folder)
+
+    buf = ReplayBuffer(
+        folder,
+        max_episodes = 5,
+        max_timesteps = 20,
+        fields = dict(
+            returns = 'float',
+            value = ('float', 10),
+        ),
+        circular = True,
+        overwrite = True
+    )
+
+    for ep in range(3):
+        with buf.one_episode():
+            for t in range(8):
+                buf.store(returns=0., value=torch.zeros(10))
+
+    # Test 1: batch update with np.array indices
+    indices = np.array([0, 1, 2])
+    returns = torch.randn(3, 8)
+    values = torch.randn(3, 8, 10)
+    buf.update(indices, returns=returns, value=values)
+    assert np.allclose(buf.data['returns'][0, 0], returns[0, 0].item(), atol=1e-6)
+
+    # Test 2: scalar index
+    returns_s = torch.randn(8)
+    buf.update(1, returns=returns_s)
+    assert np.allclose(buf.data['returns'][1, 0], returns_s[0].item(), atol=1e-6)
+
+    # Test 3: slice index
+    returns_sl = torch.randn(2, 8)
+    buf.update(slice(0, 2), returns=returns_sl)
+    assert np.allclose(buf.data['returns'][0, 0], returns_sl[0, 0].item(), atol=1e-6)
+
+    # Test 4: indices=None (all populated episodes)
+    returns_all = torch.randn(3, 8)
+    buf.update(returns=returns_all)
+    for i in range(3):
+        assert np.allclose(buf.data['returns'][i, 0], returns_all[i, 0].item(), atol=1e-6)
+
+    # Test 5: partial time dimension
+    partial = torch.randn(1, 5)
+    buf.update(np.array([0]), returns=partial)
+    assert np.allclose(buf.data['returns'][0, 4], partial[0, 4].item(), atol=1e-6)
+
+    shutil.rmtree(folder)
