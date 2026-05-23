@@ -582,7 +582,12 @@ class ReplayBufferH5PY:
         self.timestep_index = time_dim
         self.advance_episode()
 
-    def get_all_data(self, fields = None, meta_fields = None):
+    def get_all_data(
+        self,
+        fields = None,
+        meta_fields = None,
+        device: torch.device | str | None = None
+    ):
         self.flush()
 
         n = self.num_episodes
@@ -606,7 +611,7 @@ class ReplayBufferH5PY:
         for name in meta_data_fields:
             all_data[name] = from_numpy(self.meta_data[name][:n])
 
-        return all_data
+        return tree_map_to_device(all_data, device)
 
     @beartype
     def dataset(

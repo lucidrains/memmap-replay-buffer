@@ -988,7 +988,8 @@ class ReplayBuffer:
     def get_all_data(
         self,
         fields: tuple[str, ...] | None = None,
-        meta_fields: tuple[str, ...] | None = None
+        meta_fields: tuple[str, ...] | None = None,
+        device: torch.device | str | None = None
     ):
         self.flush()
 
@@ -1018,7 +1019,7 @@ class ReplayBuffer:
             memmap = self.meta_data[name]
             all_data[name] = from_numpy(memmap[:n].copy())
 
-        return all_data
+        return tree_map_to_device(all_data, device)
 
     @beartype
     def dataset(

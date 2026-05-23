@@ -1,6 +1,6 @@
 [project]
 name = "memmap-replay-buffer"
-version = "0.1.2"
+version = "0.1.4"
 description = "Simple Replay Buffer for RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -46,6 +46,9 @@ test = [
 [tool.pytest.ini_options]
 pythonpath = [
     "."
+]
+testpaths = [
+    "tests"
 ]
 
 [build-system]
