@@ -325,3 +325,33 @@ def test_update():
     assert np.allclose(buf.data['returns'][0, 4], partial[0, 4].item(), atol=1e-6)
 
     shutil.rmtree(folder)
+
+def test_slice_by_episode_len():
+    from memmap_replay_buffer import ReplayBuffer
+    import shutil
+    import torch
+
+    folder = './test_slice'
+    if shutil.os.path.exists(folder):
+        shutil.rmtree(folder)
+
+    buffer = ReplayBuffer(
+        folder,
+        max_episodes = 2,
+        max_timesteps = 10,
+        fields = dict(state = 'float'),
+    )
+
+    with buffer.one_episode():
+        for _ in range(3):
+            buffer.store(state=0.0)
+
+    # with default slice_by_episode_len=True, state should have shape (3,)
+    dataset_sliced = buffer.dataset(slice_by_episode_len=True)
+    assert dataset_sliced[0]['state'].shape[0] == 3
+
+    # with slice_by_episode_len=False, state should have shape (10,)
+    dataset_unsliced = buffer.dataset(slice_by_episode_len=False)
+    assert dataset_unsliced[0]['state'].shape[0] == 10
+
+    shutil.rmtree(folder)

@@ -122,6 +122,7 @@ class ReplayDatasetTrajectory(Dataset):
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
         return_indices: bool = False,
+        slice_by_episode_len: bool = True,
         **kwargs
     ):
         if isinstance(replay_buffer, (str, Path)):
@@ -130,6 +131,7 @@ class ReplayDatasetTrajectory(Dataset):
             self.replay_buffer = replay_buffer
 
         self.return_indices = return_indices
+        self.slice_by_episode_len = slice_by_episode_len
         self.fieldname_map = default(fieldname_map, {})
         self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames} if include_metadata else {}
         self.fields = default(fields, tuple(self.replay_buffer.fieldnames))
@@ -162,7 +164,13 @@ class ReplayDatasetTrajectory(Dataset):
 
         for field in self.fields:
             name = self.fieldname_map.get(field, field)
-            data[name] = from_numpy(self.replay_buffer.data[field][episode_index, :episode_len].copy())
+
+            arr = self.replay_buffer.data[field][episode_index]
+
+            if self.slice_by_episode_len:
+                arr = arr[:episode_len]
+
+            data[name] = from_numpy(arr.copy())
 
         for field, memmap in self.meta_data.items():
             name = self.fieldname_map.get(field, field)
@@ -1033,6 +1041,7 @@ class ReplayBuffer:
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
         fieldname_map: dict[str, str] | None = None,
+        slice_by_episode_len: bool = True,
         **kwargs
     ) -> Dataset:
         self.flush()
@@ -1067,6 +1076,7 @@ class ReplayBuffer:
                 filter_meta = filter_meta,
                 filter_fields = filter_fields,
                 fieldname_map = fieldname_map,
+                slice_by_episode_len = slice_by_episode_len,
                 **kwargs
             )
 
