@@ -355,3 +355,78 @@ def test_slice_by_episode_len():
     assert dataset_unsliced[0]['state'].shape[0] == 10
 
     shutil.rmtree(folder)
+
+def test_return_episode_lens():
+    from memmap_replay_buffer import ReplayBuffer
+
+    replay_buffer = ReplayBuffer(
+        './replay_data_lens',
+        max_episodes = 10,
+        max_timesteps = 10,
+        fields = dict(
+            state = 'float',
+        )
+    )
+
+    with replay_buffer.one_episode():
+        for _ in range(5):
+            replay_buffer.store(state = torch.randn(()))
+
+    dataset_with_lens = replay_buffer.dataset(return_episode_lens=True)
+    assert '_lens' in dataset_with_lens[0]
+
+    dataset_without_lens = replay_buffer.dataset(return_episode_lens=False)
+    assert '_lens' not in dataset_without_lens[0]
+
+    with pytest.raises(AssertionError):
+        replay_buffer.dataset(slice_by_episode_len=False, return_episode_lens=False)
+
+def test_slice_by_episode_len_multiple_fields():
+    from memmap_replay_buffer import ReplayBuffer
+    import torch
+
+    replay_buffer = ReplayBuffer(
+        './replay_data_slice_multiple',
+        max_episodes = 10,
+        max_timesteps = 10,
+        fields = dict(
+            state = ('float', (8,)),
+            action = 'int',
+            actions = 'int',
+            reward = 'float'
+        )
+    )
+
+    with replay_buffer.one_episode():
+        for _ in range(3):
+            replay_buffer.store(
+                state = torch.randn((8,)),
+                action = torch.randint(0, 4, ()),
+                actions = torch.randint(0, 4, ()),
+                reward = torch.randn(())
+            )
+
+    with replay_buffer.one_episode():
+        for _ in range(7):
+            replay_buffer.store(
+                state = torch.randn((8,)),
+                action = torch.randint(0, 4, ()),
+                actions = torch.randint(0, 4, ()),
+                reward = torch.randn(())
+            )
+
+    dataset = replay_buffer.dataset(slice_by_episode_len=True)
+
+    assert len(dataset) == 2
+
+    ep1 = dataset[0]
+    assert ep1['state'].shape[0] == 3
+    assert ep1['action'].shape[0] == 3
+    assert ep1['actions'].shape[0] == 3
+    assert ep1['reward'].shape[0] == 3
+
+    ep2 = dataset[1]
+    assert ep2['state'].shape[0] == 7
+    assert ep2['action'].shape[0] == 7
+    assert ep2['actions'].shape[0] == 7
+    assert ep2['reward'].shape[0] == 7

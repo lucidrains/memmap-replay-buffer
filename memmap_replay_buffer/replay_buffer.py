@@ -123,6 +123,7 @@ class ReplayDatasetTrajectory(Dataset):
         filter_fields: dict | None = None,
         return_indices: bool = False,
         slice_by_episode_len: bool = True,
+        return_episode_lens: bool = True,
         **kwargs
     ):
         if isinstance(replay_buffer, (str, Path)):
@@ -132,11 +133,13 @@ class ReplayDatasetTrajectory(Dataset):
 
         self.return_indices = return_indices
         self.slice_by_episode_len = slice_by_episode_len
+        self.return_episode_lens = return_episode_lens
         self.fieldname_map = default(fieldname_map, {})
         self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames} if include_metadata else {}
         self.fields = default(fields, tuple(self.replay_buffer.fieldnames))
 
         assert not exists(filter_fields), 'filter_fields is only supported for timestep-level and n-step datasets'
+        assert slice_by_episode_len or return_episode_lens, 'cannot turn off return_episode_lens if slice_by_episode_len is also turned off'
 
         episode_ids = arange(self.replay_buffer.max_episodes)
         episode_lens = from_numpy(self.replay_buffer.episode_lens)
@@ -176,7 +179,8 @@ class ReplayDatasetTrajectory(Dataset):
             name = self.fieldname_map.get(field, field)
             data[name] = from_numpy(memmap[episode_index].copy())
 
-        data['_lens'] = tensor(episode_len)
+        if self.return_episode_lens:
+            data['_lens'] = tensor(episode_len)
 
         if self.return_indices:
             data['_index'] = tensor(episode_index)
@@ -1042,6 +1046,7 @@ class ReplayBuffer:
         filter_fields: dict | None = None,
         fieldname_map: dict[str, str] | None = None,
         slice_by_episode_len: bool = True,
+        return_episode_lens: bool = True,
         **kwargs
     ) -> Dataset:
         self.flush()
@@ -1077,6 +1082,7 @@ class ReplayBuffer:
                 filter_fields = filter_fields,
                 fieldname_map = fieldname_map,
                 slice_by_episode_len = slice_by_episode_len,
+                return_episode_lens = return_episode_lens,
                 **kwargs
             )
 
