@@ -705,8 +705,9 @@ class ReplayBuffer:
     def store_meta_batch(self, **data):
         return self._store_batch(data, is_meta = True)
 
-    @can_write
     def flush(self):
+        if self.read_only:
+            return
 
         if self.timestep_index > 0:
             self.episode_lens[self.episode_index] = self.timestep_index

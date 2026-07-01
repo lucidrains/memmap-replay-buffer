@@ -1,5 +1,6 @@
 import pytest
 import torch
+from pathlib import Path
 
 def test_replay():
     from memmap_replay_buffer import ReplayBuffer
@@ -430,3 +431,168 @@ def test_slice_by_episode_len_multiple_fields():
     assert ep2['action'].shape[0] == 7
     assert ep2['actions'].shape[0] == 7
     assert ep2['reward'].shape[0] == 7
+
+def test_concat_replay_buffer(tmp_path: Path):
+    import numpy as np
+    from memmap_replay_buffer import ReplayBuffer, ConcatReplayBuffer
+
+    folder1 = tmp_path / "buf1"
+    folder2 = tmp_path / "buf2"
+
+    # Create first buffer
+    buf1 = ReplayBuffer(
+        folder=folder1,
+        max_episodes=2,
+        max_timesteps=10,
+        fields=dict(
+            state=("float", (4,)),
+            action="int",
+            reward="float"
+        ),
+        meta_fields=dict(
+            reward_sum="float"
+        )
+    )
+
+    # Store 1 episode in buf1
+    with buf1.one_episode(reward_sum=1.0) as meta:
+        for t in range(5):
+            buf1.store(
+                state=np.array([1, 1, 1, 1]) * t,
+                action=0,
+                reward=1.0
+            )
+
+    # Create second buffer
+    buf2 = ReplayBuffer(
+        folder=folder2,
+        max_episodes=3,
+        max_timesteps=12,  # can be different
+        fields=dict(
+            state=("float", (4,)),
+            action="int",
+            reward="float"
+        ),
+        meta_fields=dict(
+            reward_sum="float"
+        )
+    )
+
+    # Store 2 episodes in buf2
+    with buf2.one_episode(reward_sum=2.0) as meta:
+        for t in range(8):
+            buf2.store(
+                state=np.array([2, 2, 2, 2]) * t,
+                action=1,
+                reward=2.0
+            )
+
+    with buf2.one_episode(reward_sum=3.0) as meta:
+        for t in range(3):
+            buf2.store(
+                state=np.array([3, 3, 3, 3]) * t,
+                action=2,
+                reward=3.0
+            )
+
+    # Create a completely empty buffer
+    folder4 = tmp_path / "buf4"
+    buf4 = ReplayBuffer(
+        folder=folder4,
+        max_episodes=2,
+        max_timesteps=10,
+        fields=dict(state=("float", (4,)), action="int", reward="float"),
+        meta_fields=dict(reward_sum="float")
+    )
+
+    # Now create ConcatReplayBuffer with an empty buffer included
+    concat_buf = ConcatReplayBuffer([folder1, folder4, folder2])
+
+    assert concat_buf.num_episodes == 3
+    assert concat_buf.max_episodes == 7
+    assert concat_buf.max_timesteps == 12
+    assert len(concat_buf) == 3
+
+    # Test dataset
+    ds = concat_buf.dataset()
+    assert len(ds) == 3
+
+    # First item
+    item0 = ds[0]
+    assert item0["state"].shape == (5, 4)
+    assert item0["reward_sum"].item() == 1.0
+    assert torch.all(item0["state"][0] == 0)
+    assert torch.all(item0["state"][-1] == 4)
+    assert item0["_lens"].item() == 5
+
+    # Second item
+    item1 = ds[1]
+    assert item1["state"].shape == (8, 4)
+    assert item1["reward_sum"].item() == 2.0
+    assert item1["_lens"].item() == 8
+
+    # Third item
+    item2 = ds[2]
+    assert item2["state"].shape == (3, 4)
+    assert item2["reward_sum"].item() == 3.0
+    assert item2["_lens"].item() == 3
+
+    # Test get_all_data
+    all_data = concat_buf.get_all_data()
+    # Padded state should be (3, 8, 4) since max length across these episodes is 8
+    assert all_data["state"].shape == (3, 8, 4)
+    assert all_data["reward_sum"].shape == (3,)
+    assert all_data["action"].shape == (3, 8)
+
+    # Ensure padding is zeros
+    # item 0 has length 5, so remaining 3 steps should be padded with 0
+    assert torch.all(all_data["state"][0, 5:] == 0)
+    assert torch.all(all_data["action"][0, 5:] == 0)
+
+    # Test dataloader
+    dl = concat_buf.dataloader(batch_size=2)
+    batches = list(dl)
+    assert len(batches) == 2
+
+    b0 = batches[0]
+    assert b0["state"].shape == (2, 8, 4) # max length in this batch is 8 (from item1)
+
+    b1 = batches[1]
+    assert b1["state"].shape == (1, 3, 4) # length in this batch is 3 (from item2)
+
+    # Create third buffer to match the concatenated buffers
+    folder3 = tmp_path / "buf3"
+    buf3 = ReplayBuffer(
+        folder=folder3,
+        max_episodes=5,
+        max_timesteps=12,
+        fields=dict(
+            state=("float", (4,)),
+            action="int",
+            reward="float"
+        ),
+        meta_fields=dict(
+            reward_sum="float"
+        )
+    )
+
+    with buf3.one_episode(reward_sum=1.0) as meta:
+        for t in range(5):
+            buf3.store(state=np.array([1, 1, 1, 1]) * t, action=0, reward=1.0)
+
+    with buf3.one_episode(reward_sum=2.0) as meta:
+        for t in range(8):
+            buf3.store(state=np.array([2, 2, 2, 2]) * t, action=1, reward=2.0)
+
+    with buf3.one_episode(reward_sum=3.0) as meta:
+        for t in range(3):
+            buf3.store(state=np.array([3, 3, 3, 3]) * t, action=2, reward=3.0)
+
+    all_data_buf3 = buf3.get_all_data()
+
+    for k in all_data.keys():
+        assert torch.allclose(all_data[k], all_data_buf3[k])
+
+    # test write guard
+    with pytest.raises(NotImplementedError):
+        concat_buf.clear()
