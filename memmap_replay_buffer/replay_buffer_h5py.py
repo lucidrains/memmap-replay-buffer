@@ -285,6 +285,10 @@ class ReplayBufferH5PY:
     def timestep_index(self, value):
         self.file.attrs['timestep_index'] = value
 
+    @property
+    def is_new_episode(self):
+        return self.timestep_index == 0
+
     def __len__(self):
         return (self.episode_lens[:] > 0).sum().item()
 
@@ -311,7 +315,7 @@ class ReplayBufferH5PY:
 
     @can_write
     def advance_episode(self, batch_size = 1):
-        if self.timestep_index == 0 and batch_size == 1:
+        if self.is_new_episode and batch_size == 1:
             return
 
         assert self.circular or self.num_episodes + batch_size <= self.max_episodes
@@ -390,6 +394,9 @@ class ReplayBufferH5PY:
 
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
+        if self.is_new_episode:
+            self._lazy_init_episodes(indices)
+
         for name, values in data.items():
             if is_meta:
                 self.store_batch_meta_datapoint(indices, name, values)
@@ -424,6 +431,8 @@ class ReplayBufferH5PY:
         if not self.circular and self.num_episodes >= self.max_episodes:
             raise ValueError("Buffer full")
 
+        self._lazy_init_episodes(np.array([self.episode_index]))
+
         for name, value in meta_data.items():
             self.store_meta_datapoint(self.episode_index, name, value)
 
@@ -443,6 +452,9 @@ class ReplayBufferH5PY:
         if not self.circular and self.num_episodes + batch_size > self.max_episodes:
             raise ValueError("Buffer full")
 
+        next_indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+        self._lazy_init_episodes(next_indices)
+
         if len(meta_batch) > 0:
             self.store_meta_batch(**meta_batch)
 
@@ -453,7 +465,6 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_datapoint(self, episode_index, timestep_index, name, datapoint):
-        self._lazy_init_episodes(np.array([episode_index]))
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -464,7 +475,6 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_meta_datapoint(self, episode_index, name, datapoint):
-        self._lazy_init_episodes(np.array([episode_index]))
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -475,7 +485,6 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_batch_datapoint(self, episode_indices, timestep_index, name, datapoints):
-        self._lazy_init_episodes(np.atleast_1d(episode_indices))
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -483,7 +492,6 @@ class ReplayBufferH5PY:
 
     @can_write
     def store_batch_meta_datapoint(self, episode_indices, name, datapoints):
-        self._lazy_init_episodes(np.atleast_1d(episode_indices))
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -492,6 +500,9 @@ class ReplayBufferH5PY:
     def store(self, **data):
         if self.timestep_index >= self.max_timesteps:
             raise ValueError("Max timesteps exceeded")
+
+        if self.is_new_episode:
+            self._lazy_init_episodes(np.array([self.episode_index]))
 
         store_data = dict()
 
@@ -525,7 +536,7 @@ class ReplayBufferH5PY:
         self,
         **data
     ):
-        if self.timestep_index != 0:
+        if not self.is_new_episode:
             warnings.warn(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
 
         assert len(data) > 0, 'No data provided to `store_episode`'

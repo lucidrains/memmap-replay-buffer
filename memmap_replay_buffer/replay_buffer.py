@@ -561,6 +561,10 @@ class ReplayBuffer:
         self._timestep_index[()] = value
         self._timestep_index.flush()
 
+    @property
+    def is_new_episode(self):
+        return self.timestep_index == 0
+
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
 
@@ -590,7 +594,7 @@ class ReplayBuffer:
 
         # if episode length is 0, and not batching, do not advance
 
-        if self.timestep_index == 0 and batch_size == 1:
+        if self.is_new_episode and batch_size == 1:
             return
 
         assert self.circular or self.num_episodes + batch_size <= self.max_episodes, f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.'
@@ -680,6 +684,9 @@ class ReplayBuffer:
 
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
+        if self.is_new_episode:
+            self._lazy_init_episodes(indices)
+
         # store data
 
         for name, values in data.items():
@@ -729,6 +736,8 @@ class ReplayBuffer:
         if not self.circular and self.num_episodes >= self.max_episodes:
             raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
+        self._lazy_init_episodes(np.array([self.episode_index]))
+
         for name, value in meta_data.items():
             self.store_meta_datapoint(self.episode_index, name, value)
 
@@ -749,6 +758,9 @@ class ReplayBuffer:
         if not self.circular and self.num_episodes + batch_size > self.max_episodes:
             raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
+        next_indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
+        self._lazy_init_episodes(next_indices)
+
         if len(meta_batch) > 0:
             self.store_meta_batch(**meta_batch)
 
@@ -768,8 +780,6 @@ class ReplayBuffer:
 
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
-
-        self._lazy_init_episodes(np.array([episode_index]))
 
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
@@ -793,8 +803,6 @@ class ReplayBuffer:
 
         assert 0 <= episode_index < self.max_episodes
 
-        self._lazy_init_episodes(np.array([episode_index]))
-
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
@@ -815,8 +823,6 @@ class ReplayBuffer:
         name: str,
         datapoints: Tensor | ndarray
     ):
-        self._lazy_init_episodes(np.atleast_1d(episode_indices))
-
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -831,8 +837,6 @@ class ReplayBuffer:
         name: str,
         datapoints: Tensor | ndarray
     ):
-        self._lazy_init_episodes(np.atleast_1d(episode_indices))
-
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
@@ -848,6 +852,9 @@ class ReplayBuffer:
 
         if self.timestep_index >= self.max_timesteps:
             raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
+        if self.is_new_episode:
+            self._lazy_init_episodes(np.array([self.episode_index]))
 
         # filter to only what is defined in the namedtuple, and store those that are present
 
@@ -883,7 +890,7 @@ class ReplayBuffer:
         self,
         **data
     ):
-        if self.timestep_index != 0:
+        if not self.is_new_episode:
             logger.warning(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
 
         assert len(data) > 0, 'No data provided to `store_episode`'
@@ -964,8 +971,6 @@ class ReplayBuffer:
         else:
             indices = np.atleast_1d(np.asarray(indices))
             scalar_index = False
-
-        self._lazy_init_episodes(indices)
 
         for name, value in data.items():
             if is_tensor(value):

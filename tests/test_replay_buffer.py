@@ -596,3 +596,33 @@ def test_concat_replay_buffer(tmp_path: Path):
     # test write guard
     with pytest.raises(NotImplementedError):
         concat_buf.clear()
+
+def test_store_meta_after_episode():
+    from memmap_replay_buffer import ReplayBuffer
+    import shutil
+
+    folder = './test_meta_after_episode'
+    if shutil.os.path.exists(folder):
+        shutil.rmtree(folder)
+
+    buffer = ReplayBuffer(
+        folder,
+        max_episodes=1,
+        max_timesteps=10,
+        fields=dict(reward='float'),
+        meta_fields=dict(cum_reward='float'),
+        circular=True
+    )
+
+    with buffer.one_episode():
+        for _ in range(5):
+            buffer.store(reward=1.0)
+
+    buffer.store_meta_datapoint(0, 'cum_reward', 5.0)
+
+    dataset = buffer.dataset()
+    assert len(dataset) == 1
+
+    data = dataset[0]
+    assert torch.all(data['reward'] == 1.0), "Data was improperly zeroed out!"
+    assert data['cum_reward'].item() == 5.0
