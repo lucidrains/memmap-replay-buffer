@@ -626,3 +626,35 @@ def test_store_meta_after_episode():
     data = dataset[0]
     assert torch.all(data['reward'] == 1.0), "Data was improperly zeroed out!"
     assert data['cum_reward'].item() == 5.0
+
+def test_del_flushes_buffer(tmp_path):
+    import gc
+    from memmap_replay_buffer import ReplayBuffer
+
+    def create_and_destroy_buffer():
+        buffer = ReplayBuffer(
+            folder = tmp_path,
+            max_episodes = 5,
+            max_timesteps = 10,
+            fields = dict(state = 'float', action = 'int')
+        )
+
+        for i in range(3):
+            buffer.store(state = float(i), action = i)
+
+    create_and_destroy_buffer()
+    gc.collect()
+
+    buffer2 = ReplayBuffer(
+        folder = tmp_path,
+        max_episodes = 5,
+        max_timesteps = 10,
+        fields = dict(state = 'float', action = 'int'),
+        overwrite = False
+    )
+
+    assert buffer2.episode_lens[0] == 3
+
+    import numpy as np
+    assert np.allclose(buffer2.data['state'][0, :3], [0., 1., 2.])
+    assert np.allclose(buffer2.data['action'][0, :3], [0, 1, 2])

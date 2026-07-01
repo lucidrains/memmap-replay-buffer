@@ -5,7 +5,7 @@ import warnings
 import numpy as np
 from pathlib import Path
 from collections import namedtuple, defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from functools import partial
 import einx
@@ -260,6 +260,14 @@ class ReplayBufferH5PY:
         self.store_step = 0
         self.should_flush = flush_every_store_step > 0
         self.flush_every_store_step = flush_every_store_step
+
+    def __del__(self):
+        with suppress(Exception):
+            if self.read_only:
+                return self.file.close()
+
+            self.flush()
+            self.file.close()
 
     @property
     def num_episodes(self):
@@ -787,10 +795,6 @@ class ReplayBufferH5PY:
 
         if self.circular:
             self.num_episodes = min(self.num_episodes, self.max_episodes)
-
-    def __del__(self):
-        if hasattr(self, 'file'):
-            self.file.close()
 
     @classmethod
     def from_folder(cls, folder: str | Path, read_only: bool = False):

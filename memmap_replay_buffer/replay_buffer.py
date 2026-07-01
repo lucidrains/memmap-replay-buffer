@@ -9,7 +9,7 @@ from loguru import logger
 from functools import partial, wraps
 from pathlib import Path
 from shutil import rmtree
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from collections import namedtuple
 
 import numpy as np
@@ -38,6 +38,8 @@ FieldInfo = (
 )
 
 # helpers
+
+
 
 def exists(v):
     return v is not None
@@ -520,6 +522,12 @@ class ReplayBuffer:
         self.store_step = 0
         self.should_flush = flush_every_store_step > 0
         self.flush_every_store_step = flush_every_store_step
+
+    def __del__(self):
+        with suppress(Exception):
+            if self.read_only:
+                return
+            self.flush()
 
     @classmethod
     def from_folder(cls, folder: str | Path, read_only: bool = False):
