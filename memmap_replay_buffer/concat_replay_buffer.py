@@ -59,7 +59,7 @@ class ConcatReplayBuffer:
         meta_fields: tuple[str, ...] | None = None,
         device: torch.device | str | None = None
     ) -> dict[str, Tensor]:
-        
+
         all_data = [b.get_all_data(fields=fields, meta_fields=meta_fields, device=device) for b in self.buffers]
         all_data = [d for d in all_data if len(d) > 0]
 
@@ -68,7 +68,7 @@ class ConcatReplayBuffer:
 
         keys = all_data[0].keys()
         data_fields = self.fieldnames if not exists(fields) and not exists(meta_fields) else default(fields, ())
-        
+
         out = dict()
 
         for key in keys:

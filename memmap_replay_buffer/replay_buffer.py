@@ -190,6 +190,80 @@ class ReplayDatasetTrajectory(Dataset):
         return data
 
 
+class ReplayDatasetTimeWindow(Dataset):
+    def __init__(
+        self,
+        replay_buffer: str | Path | ReplayBuffer,
+        window_length: int,
+        fields: tuple[str, ...] | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        include_metadata: bool = True,
+        filter_meta: dict | None = None,
+        return_indices: bool = False,
+        **kwargs
+    ):
+        if isinstance(replay_buffer, (str, Path)):
+            self.replay_buffer = ReplayBuffer.from_folder(replay_buffer)
+        else:
+            self.replay_buffer = replay_buffer
+
+        self.window_length = window_length
+        self.return_indices = return_indices
+        self.fieldname_map = default(fieldname_map, {})
+        self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames} if include_metadata else {}
+        self.fields = default(fields, tuple(self.replay_buffer.fieldnames))
+
+        episode_lens = from_numpy(self.replay_buffer.episode_lens)
+        valid_mask = episode_lens > 0
+
+        for field, value in default(filter_meta, {}).items():
+            field_data = from_numpy(self.replay_buffer.meta_data[field])
+            if isinstance(value, bool):
+                field_data = field_data.bool()
+            valid_mask &= (field_data == value)
+
+        self.indices = arange(self.replay_buffer.max_episodes)[valid_mask]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        episode_index = self.indices[idx].item()
+        episode_len = self.replay_buffer.episode_lens[episode_index]
+        window_len = self.window_length
+
+        actual_len = min(window_len, episode_len)
+        start = torch.randint(0, episode_len - actual_len + 1, (1,)).item()
+        end = start + actual_len
+
+        data = dict()
+
+        for field in self.fields:
+            name = self.fieldname_map.get(field, field)
+            t = from_numpy(self.replay_buffer.data[field][episode_index, start:end].copy())
+
+            if actual_len < window_len:
+                t = pad_right_at_dim_to(t, window_len, dim = 0)
+
+            data[name] = t
+
+        for field, memmap in self.meta_data.items():
+            name = self.fieldname_map.get(field, field)
+            data[name] = from_numpy(memmap[episode_index].copy())
+
+        data.update(
+            _lens = tensor(actual_len, dtype = torch.long),
+            _reaches_episode_end = tensor(end >= episode_len, dtype = torch.bool)
+        )
+
+        if self.return_indices:
+            data.update(
+                _index = tensor(episode_index),
+                _start = tensor(start)
+            )
+
+        return data
+
 class ReplayDatasetTimestep(Dataset):
 
     def __init__(
