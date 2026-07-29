@@ -299,6 +299,9 @@ class ReplayDatasetTimestep(Dataset):
         valid_episodes = episode_ids[valid_mask]
         valid_episode_lens = episode_lens[valid_mask]
 
+        self.valid_episodes = valid_episodes
+        self.valid_episode_lens = valid_episode_lens
+
         timesteps = arange(max_episode_len)
 
         episode_timesteps = stack(broadcast_tensors(
@@ -383,6 +386,9 @@ class ReplayDatasetNStep(Dataset):
 
         valid_episodes = episode_ids[valid_mask]
         valid_episode_lens = episode_lens[valid_mask]
+
+        self.valid_episodes = valid_episodes
+        self.valid_episode_lens = valid_episode_lens
 
         if len(valid_episodes) == 0:
             self.timepoints = tensor([], dtype = torch.long).reshape(0, 2)
