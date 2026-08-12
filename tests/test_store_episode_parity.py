@@ -1,17 +1,14 @@
-import shutil
 from pathlib import Path
+
 import numpy as np
-import torch
+
 from memmap_replay_buffer import ReplayBuffer
 from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY
 
-def test_memmap_parity():
-    print("Testing ReplayBuffer (memmap) parity...")
-    folder1 = Path("test_buffer_store")
-    folder2 = Path("test_buffer_store_episode")
 
-    if folder1.exists(): shutil.rmtree(folder1)
-    if folder2.exists(): shutil.rmtree(folder2)
+def test_memmap_parity(tmp_path: Path):
+    folder1 = tmp_path / 'store'
+    folder2 = tmp_path / 'store_episode'
 
     max_episodes = 5
     max_timesteps = 10
@@ -39,18 +36,9 @@ def test_memmap_parity():
     for key in fields:
         assert np.allclose(data_store[key], data_episode[key]), f"Mismatch in {key}"
 
-    print("ReplayBuffer parity test passed!")
-
-    shutil.rmtree(folder1)
-    shutil.rmtree(folder2)
-
-def test_h5py_parity():
-    print("\nTesting ReplayBufferH5PY parity...")
-    folder1 = Path("test_h5py_store")
-    folder2 = Path("test_h5py_store_episode")
-
-    if folder1.exists(): shutil.rmtree(folder1)
-    if folder2.exists(): shutil.rmtree(folder2)
+def test_h5py_parity(tmp_path: Path):
+    folder1 = tmp_path / 'h5py_store'
+    folder2 = tmp_path / 'h5py_store_episode'
 
     max_episodes = 5
     max_timesteps = 10
@@ -78,15 +66,6 @@ def test_h5py_parity():
     for key in fields:
         assert np.allclose(data_store[key], data_episode[key]), f"Mismatch in {key}"
 
-    print("ReplayBufferH5PY parity test passed!")
-
-    # Explicitly close H5 files before deleting folders
-    del buffer_store
-    del buffer_episode
-
-    shutil.rmtree(folder1)
-    shutil.rmtree(folder2)
-
 if __name__ == "__main__":
-    test_memmap_parity()
-    test_h5py_parity()
+    test_memmap_parity(Path("/tmp/memmap_parity"))
+    test_h5py_parity(Path("/tmp/h5py_parity"))

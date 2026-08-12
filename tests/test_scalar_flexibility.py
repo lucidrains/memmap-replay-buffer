@@ -1,8 +1,9 @@
-import pytest
 import numpy as np
+import pytest
 
 from memmap_replay_buffer import ReplayBuffer
 from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY
+
 
 @pytest.mark.parametrize('buffer_class', [ReplayBuffer, ReplayBufferH5PY])
 def test_scalar_shape_flexibility(tmp_path, buffer_class):

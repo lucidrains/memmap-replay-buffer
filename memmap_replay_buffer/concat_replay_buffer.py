@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from collections import namedtuple
 
 import torch
-from torch import tensor, cat, Tensor
-from torch.utils.data import Dataset, ConcatDataset, DataLoader
+from torch import Tensor, cat
+from torch.utils.data import ConcatDataset, Dataset
 
-from memmap_replay_buffer.replay_buffer import (
-    ReplayBuffer,
-    exists,
-    default
-)
+from memmap_replay_buffer.replay_buffer import ReplayBuffer, default, exists, pad_at_dim
 
-from torch_einops_utils import pad_at_dim
 
 class ConcatReplayBuffer:
     def __init__(self, folders: list[str | Path]):
         self.buffers = [ReplayBuffer.from_folder(f, read_only=True) for f in folders]
-        assert len(self.buffers) > 0, "ConcatReplayBuffer requires at least one folder"
+
+        if len(self.buffers) == 0:
+            raise ValueError("ConcatReplayBuffer requires at least one folder")
 
         # Verify compatibility
         first_buf = self.buffers[0]
@@ -26,8 +22,10 @@ class ConcatReplayBuffer:
         self.meta_fieldnames = first_buf.meta_fieldnames
 
         for b in self.buffers[1:]:
-            assert b.fieldnames == self.fieldnames, "All buffers must have the same fieldnames"
-            assert b.meta_fieldnames == self.meta_fieldnames, "All buffers must have the same meta_fieldnames"
+            if b.fieldnames != self.fieldnames:
+                raise ValueError(f"All buffers must have the same fieldnames - got {b.fieldnames} and {self.fieldnames}")
+            if b.meta_fieldnames != self.meta_fieldnames:
+                raise ValueError(f"All buffers must have the same meta_fieldnames - got {b.meta_fieldnames} and {self.meta_fieldnames}")
 
         self.read_only = True
 
@@ -47,7 +45,8 @@ class ConcatReplayBuffer:
         return sum(len(b) for b in self.buffers)
 
     def dataset(self, **kwargs) -> Dataset:
-        assert len(self) > 0, 'replay buffer is empty'
+        if len(self) == 0:
+            raise ValueError('replay buffer is empty')
         datasets = [b.dataset(**kwargs) for b in self.buffers if len(b) > 0]
         return ConcatDataset(datasets)
 

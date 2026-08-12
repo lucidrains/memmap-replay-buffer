@@ -1,5 +1,12 @@
-from memmap_replay_buffer.replay_buffer import (
-    ReplayBuffer,
-    ReplayDataset
-)
-from memmap_replay_buffer.concat_replay_buffer import ConcatReplayBuffer
+from memmap_replay_buffer.concat_replay_buffer import ConcatReplayBuffer as ConcatReplayBuffer
+from memmap_replay_buffer.replay_buffer import ReplayBuffer as ReplayBuffer
+from memmap_replay_buffer.replay_buffer import ReplayDataset as ReplayDataset
+from memmap_replay_buffer.replay_buffer import ReplayDatasetNStep as ReplayDatasetNStep
+from memmap_replay_buffer.replay_buffer import ReplayDatasetTimestep as ReplayDatasetTimestep
+from memmap_replay_buffer.replay_buffer import ReplayDatasetTimeWindow as ReplayDatasetTimeWindow
+from memmap_replay_buffer.replay_buffer import ReplayDatasetTrajectory as ReplayDatasetTrajectory
+
+try:
+    from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY as ReplayBufferH5PY
+except ImportError:
+    pass

@@ -1,25 +1,17 @@
+import numpy as np
 import pytest
 import torch
-import numpy as np
 
 h5py = pytest.importorskip("h5py")
-import shutil
-from pathlib import Path
 from memmap_replay_buffer import ReplayBuffer
 from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY
 
+
 @pytest.fixture
-def temp_folders():
-    folder_memmap = Path('./test_pytest_replay_memmap')
-    folder_h5py = Path('./test_pytest_replay_h5py')
-
-    if folder_memmap.exists(): shutil.rmtree(folder_memmap)
-    if folder_h5py.exists(): shutil.rmtree(folder_h5py)
-
+def temp_folders(tmp_path):
+    folder_memmap = tmp_path / 'memmap'
+    folder_h5py = tmp_path / 'h5py'
     yield folder_memmap, folder_h5py
-
-    if folder_memmap.exists(): shutil.rmtree(folder_memmap)
-    if folder_h5py.exists(): shutil.rmtree(folder_h5py)
 
 def test_parity_and_images(temp_folders):
     folder_mem, folder_h5 = temp_folders

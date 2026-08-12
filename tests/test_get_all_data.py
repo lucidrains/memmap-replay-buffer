@@ -1,12 +1,12 @@
-import torch
-from memmap_replay_buffer import ReplayBuffer
-import shutil
 from pathlib import Path
 
-def test_get_all_data_subselection():
-    folder = Path('./test_get_all_data_data')
-    if folder.exists():
-        shutil.rmtree(folder)
+import torch
+
+from memmap_replay_buffer import ReplayBuffer
+
+
+def test_get_all_data_subselection(tmp_path: Path):
+    folder = tmp_path / 'data'
 
     replay_buffer = ReplayBuffer(
         folder,
@@ -59,8 +59,6 @@ def test_get_all_data_subselection():
     assert 'action' in selected_both
     assert 'task_id' in selected_both
     assert 'episode_lens' not in selected_both
-
-    shutil.rmtree(folder)
 
 if __name__ == "__main__":
     test_get_all_data_subselection()

@@ -1,29 +1,26 @@
 from __future__ import annotations
-from typing import Callable, Any
+
+import pickle
+import warnings
+from collections import namedtuple
+from contextlib import contextmanager, suppress
+from functools import partial, wraps
+from pathlib import Path
+
+import einx
+import numpy as np
+import torch
 from beartype import beartype
 from beartype.door import is_bearable
 from beartype.typing import Literal
-
-import pickle
-from loguru import logger
-from functools import partial, wraps
-from pathlib import Path
-from shutil import rmtree
-from contextlib import contextmanager, suppress
-from collections import namedtuple
-
-import numpy as np
+from einops import rearrange
 from numpy import ndarray
 from numpy.lib.format import open_memmap
-
-import torch
-from torch import tensor, from_numpy as torch_from_numpy, stack, cat, is_tensor, Tensor, arange, broadcast_tensors
-from torch.utils.data import Dataset, DataLoader, default_collate
+from torch import Tensor, arange, broadcast_tensors, is_tensor, stack, tensor
+from torch import from_numpy as torch_from_numpy
+from torch.nn.functional import pad as pad_tensor
 from torch.utils._pytree import tree_map
-
-import einx
-from einops import rearrange
-from torch_einops_utils import pad_at_dim, pad_right_at_dim_to
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 # constants
 
@@ -75,8 +72,30 @@ def from_numpy(arr: ndarray):
     if arr.ndim == 0:
         arr = np.array(arr)
 
+    if not arr.flags.writeable:
+        arr = arr.copy()
+
     return torch_from_numpy(arr)
 
+def pad_right_at_dim(t, amount, dim = 0):
+    if amount <= 0:
+        return t
+
+    ndim = t.ndim
+    pad = [0] * (2 * ndim)
+    pad[2 * (ndim - 1 - dim) + 1] = amount
+    return pad_tensor(t, pad)
+
+def pad_at_dim(t, padding, dim = 0):
+    left, right = padding
+
+    if left != 0:
+        raise ValueError(f'only right padding is supported, got left padding of {left}')
+
+    return pad_right_at_dim(t, right, dim = dim)
+
+def pad_right_at_dim_to(t, target, dim = 0):
+    return pad_right_at_dim(t, target - t.shape[dim], dim = dim)
 
 def tree_map_to_device(batch, device):
     if not exists(device):
@@ -86,7 +105,8 @@ def tree_map_to_device(batch, device):
 def can_write(fn):
     @wraps(fn)
     def inner(self, *args, **kwargs):
-        assert not self.read_only, f'cannot call `{fn.__name__}` in read-only mode'
+        if self.read_only:
+            raise ValueError(f'cannot call `{fn.__name__}` in read-only mode')
         return fn(self, *args, **kwargs)
     return inner
 
@@ -140,8 +160,11 @@ class ReplayDatasetTrajectory(Dataset):
         self.meta_data = {k: v for k, v in self.replay_buffer.meta_data.items() if k not in self.replay_buffer.internal_meta_fieldnames} if include_metadata else {}
         self.fields = default(fields, tuple(self.replay_buffer.fieldnames))
 
-        assert not exists(filter_fields), 'filter_fields is only supported for timestep-level and n-step datasets'
-        assert slice_by_episode_len or return_episode_lens, 'cannot turn off return_episode_lens if slice_by_episode_len is also turned off'
+        if exists(filter_fields):
+            raise ValueError('filter_fields is only supported for timestep-level and n-step datasets')
+
+        if not slice_by_episode_len and not return_episode_lens:
+            raise ValueError('cannot turn off return_episode_lens if slice_by_episode_len is also turned off')
 
         episode_ids = arange(self.replay_buffer.max_episodes)
         episode_lens = from_numpy(self.replay_buffer.episode_lens)
@@ -313,11 +336,13 @@ class ReplayDatasetTimestep(Dataset):
 
         if exists(filter_fields):
             for field_name, filter_value in filter_fields.items():
-                field_data = from_numpy(replay_buffer.data[field_name][valid_episodes.numpy(), :max_episode_len])
+                field_data = stack([from_numpy(replay_buffer.data[field_name][ep, :max_episode_len]) for ep in valid_episodes.numpy()])
                 if isinstance(filter_value, bool):
                     field_data = field_data.bool()
 
-                assert field_data.ndim == 2, f'filter_fields only supports scalar fields, got shape {field_data.shape[2:]} for `{field_name}`'
+                if field_data.ndim != 2:
+                    raise ValueError(f'filter_fields only supports scalar fields, got shape {field_data.shape[2:]} for `{field_name}`')
+
                 valid_timesteps &= field_data == filter_value
 
         self.timepoints = episode_timesteps[valid_timesteps]
@@ -409,7 +434,9 @@ class ReplayDatasetNStep(Dataset):
                     if isinstance(filter_value, bool):
                         field_data = field_data.bool()
 
-                    assert field_data.ndim == 2, f'filter_fields only supports scalar fields, got shape {field_data.shape[2:]} for `{field_name}`'
+                    if field_data.ndim != 2:
+                        raise ValueError(f'filter_fields only supports scalar fields, got shape {field_data.shape[2:]} for `{field_name}`')
+
                     valid_timesteps &= field_data == filter_value
 
             self.timepoints = episode_timesteps[valid_timesteps]
@@ -465,27 +492,47 @@ class ReplayBuffer:
         max_episodes: int,
         max_timesteps: int,
         fields: dict[str, FieldInfo],
-        meta_fields: dict[str, FieldInfo] = dict(),
+        meta_fields: dict[str, FieldInfo] | None = None,
         circular = False,
         overwrite = True,
         read_only = False,
         flush_every_store_step: int = 1
     ):
+        meta_fields = default(meta_fields, dict())
+
         self.read_only = read_only
+
+        assert not (read_only and overwrite), 'cannot overwrite a buffer in read-only mode'
 
         # folder for data
 
         if not isinstance(folder, Path):
             folder = Path(folder)
 
-        folder.mkdir(exist_ok = True, parents = True)
+        if read_only:
+            assert folder.is_dir(), f'cannot open folder `{folder}` in read-only mode - folder does not exist'
+        else:
+            folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
         assert folder.is_dir()
 
-        # save the config if not exists
+        # save the config if not exists, and validate against any existing one
 
         config_path = folder / 'metadata.pkl'
+
+        if config_path.exists() and not overwrite:
+            with open(str(config_path), 'rb') as f:
+                stored_config = pickle.load(f)
+
+            init_locals = locals()
+
+            mismatched_keys = [key for key, value in stored_config.items() if init_locals[key] != value]
+
+            if len(mismatched_keys) > 0:
+                mismatch_lines = [f'  {key}: stored {stored_config[key]!r} vs passed {init_locals[key]!r}' for key in mismatched_keys]
+                mismatch_str = '\n'.join(mismatch_lines)
+                raise ValueError(f'buffer at `{folder}` was created with a different config:\n{mismatch_str}\nPass `overwrite = True` to recreate the buffer with the new config.')
 
         if not config_path.exists() or overwrite:
             config = dict(
@@ -505,9 +552,17 @@ class ReplayBuffer:
         episode_index_path = folder / 'episode_index.state.npy'
         timestep_index_path = folder / 'timestep_index.state.npy'
 
-        self._num_episodes = open_memmap(str(num_episodes_path), mode = 'w+' if not num_episodes_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
-        self._episode_index = open_memmap(str(episode_index_path), mode = 'w+' if not episode_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
-        self._timestep_index = open_memmap(str(timestep_index_path), mode = 'w+' if not timestep_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+        state_paths = (num_episodes_path, episode_index_path, timestep_index_path)
+
+        if read_only:
+            assert all(path.exists() for path in state_paths), f'state files not found in `{folder}` - cannot open in read-only mode'
+            state_mode = 'r'
+        else:
+            state_mode = 'w+' if not num_episodes_path.exists() or overwrite else 'r+'
+
+        self._num_episodes = open_memmap(str(num_episodes_path), mode = state_mode, dtype = np.int32, shape = ())
+        self._episode_index = open_memmap(str(episode_index_path), mode = state_mode, dtype = np.int32, shape = ())
+        self._timestep_index = open_memmap(str(timestep_index_path), mode = state_mode, dtype = np.int32, shape = ())
 
         if overwrite:
             self.num_episodes = 0
@@ -559,7 +614,13 @@ class ReplayBuffer:
 
             filepath = folder / f'{field_name}.data.meta.npy'
 
-            memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, *shape))
+            if read_only:
+                assert filepath.exists(), f'`{filepath}` not found - cannot open in read-only mode'
+                memmap_mode = 'r'
+            else:
+                memmap_mode = 'w+' if overwrite or not filepath.exists() else 'r+'
+
+            memmap = open_memmap(str(filepath), mode = memmap_mode, dtype = dtype, shape = (max_episodes, *shape))
 
             self.meta_data[field_name] = memmap
             self.meta_shapes[field_name] = shape
@@ -576,7 +637,8 @@ class ReplayBuffer:
         self.defaults = dict()
         self.fieldnames = set(fields.keys())
 
-        assert self.fieldnames.isdisjoint(self.meta_fieldnames), f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}'
+        if not self.fieldnames.isdisjoint(self.meta_fieldnames):
+            raise ValueError(f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}')
 
         for field_name, field_info in fields.items():
 
@@ -586,7 +648,13 @@ class ReplayBuffer:
 
             filepath = folder / f'{field_name}.data.npy'
 
-            memmap = open_memmap(str(filepath), mode = 'w+' if overwrite or not filepath.exists() else 'r+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+            if read_only:
+                assert filepath.exists(), f'`{filepath}` not found - cannot open in read-only mode'
+                memmap_mode = 'r'
+            else:
+                memmap_mode = 'w+' if overwrite or not filepath.exists() else 'r+'
+
+            memmap = open_memmap(str(filepath), mode = memmap_mode, dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
 
             self.data[field_name] = memmap
             self.shapes[field_name] = shape
@@ -597,7 +665,8 @@ class ReplayBuffer:
 
         # how often to flush for store
 
-        assert flush_every_store_step >= 0
+        if flush_every_store_step < 0:
+            raise ValueError(f'flush_every_store_step must be >= 0, got {flush_every_store_step}')
 
         self.store_step = 0
         self.should_flush = flush_every_store_step > 0
@@ -615,7 +684,9 @@ class ReplayBuffer:
             folder = Path(folder)
 
         config_path = folder / 'metadata.pkl'
-        assert config_path.exists(), f'metadata.pkl not found in {folder}'
+
+        if not config_path.exists():
+            raise ValueError(f'metadata.pkl not found in {folder}')
 
         with open(str(config_path), 'rb') as f:
             config = pickle.load(f)
@@ -685,7 +756,8 @@ class ReplayBuffer:
         if self.is_new_episode and batch_size == 1:
             return
 
-        assert self.circular or self.num_episodes + batch_size <= self.max_episodes, f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.'
+        if not self.circular and self.num_episodes + batch_size > self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
@@ -732,10 +804,13 @@ class ReplayBuffer:
         data: dict[str, Tensor | ndarray | list | tuple],
         is_meta = False
     ):
-        assert len(data) > 0, f'No data provided to {"store_meta_batch" if is_meta else "store_batch"}'
+        if len(data) == 0:
+            raise ValueError(f'No data provided to {"store_meta_batch" if is_meta else "store_batch"}')
 
         fieldnames = self.meta_fieldnames if is_meta else self.fieldnames
-        assert set(data.keys()).issubset(fieldnames), f'invalid {"meta " if is_meta else ""}field names {set(data.keys()) - fieldnames} - must be a subset of {fieldnames}'
+
+        if not set(data.keys()).issubset(fieldnames):
+            raise ValueError(f'invalid {"meta " if is_meta else ""}field names {set(data.keys()) - fieldnames} - must be a subset of {fieldnames}')
 
         # get batch size
 
@@ -751,9 +826,14 @@ class ReplayBuffer:
             if not exists(batch_size):
                 batch_size = curr_batch_size
 
-            assert batch_size == curr_batch_size, f'All data in batch must have the same batch size. Field {key} has batch size {curr_batch_size} while previous fields had {batch_size}.'
+            if batch_size != curr_batch_size:
+                raise ValueError(f'All data in batch must have the same batch size. Field {key} has batch size {curr_batch_size} while previous fields had {batch_size}.')
 
-        assert exists(batch_size), 'Could not determine batch size from data'
+        if not exists(batch_size):
+            raise ValueError('Could not determine batch size from data')
+
+        if not is_meta and self.timestep_index >= self.max_timesteps:
+            raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
 
         # handle non-circular buffer constraints
 
@@ -831,7 +911,11 @@ class ReplayBuffer:
 
         final_meta_data_store = dict()
 
-        yield final_meta_data_store
+        try:
+            yield final_meta_data_store
+        except Exception:
+            self.timestep_index = 0
+            raise
 
         for name, value in final_meta_data_store.items():
             self.store_meta_datapoint(self.episode_index, name, value)
@@ -852,7 +936,11 @@ class ReplayBuffer:
         if len(meta_batch) > 0:
             self.store_meta_batch(**meta_batch)
 
-        yield
+        try:
+            yield
+        except Exception:
+            self.timestep_index = 0
+            raise
 
         self.flush()
         self.advance_episode(batch_size = batch_size)
@@ -866,8 +954,11 @@ class ReplayBuffer:
         datapoint: PrimitiveType | Tensor | ndarray
     ):
 
-        assert 0 <= episode_index < self.max_episodes
-        assert 0 <= timestep_index < self.max_timesteps
+        if not (0 <= episode_index < self.max_episodes):
+            raise ValueError(f'episode_index {episode_index} out of range - must be in [0, {self.max_episodes})')
+
+        if not (0 <= timestep_index < self.max_timesteps):
+            raise ValueError(f'timestep_index {timestep_index} out of range - must be in [0, {self.max_timesteps})')
 
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
@@ -875,9 +966,11 @@ class ReplayBuffer:
         if is_bearable(datapoint, PrimitiveType):
             datapoint = np.array(datapoint)
 
-        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+        if name not in self.fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames}')
 
-        assert datapoint.shape == self.shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
+        if datapoint.shape != self.shapes[name]:
+            raise ValueError(f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}')
 
         self.data[name][episode_index, timestep_index] = datapoint
 
@@ -889,7 +982,8 @@ class ReplayBuffer:
         datapoint: PrimitiveType | Tensor | ndarray
     ):
 
-        assert 0 <= episode_index < self.max_episodes
+        if not (0 <= episode_index < self.max_episodes):
+            raise ValueError(f'episode_index {episode_index} out of range - must be in [0, {self.max_episodes})')
 
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
@@ -897,9 +991,11 @@ class ReplayBuffer:
         if is_bearable(datapoint, PrimitiveType):
             datapoint = np.array(datapoint)
 
-        assert name in self.meta_fieldnames, f'invalid field name {name} - must be one of {self.meta_fieldnames}'
+        if name not in self.meta_fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.meta_fieldnames}')
 
-        assert datapoint.shape == self.meta_shapes[name], f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}'
+        if datapoint.shape != self.meta_shapes[name]:
+            raise ValueError(f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}')
 
         self.meta_data[name][episode_index] = datapoint
 
@@ -914,7 +1010,8 @@ class ReplayBuffer:
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
-        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+        if name not in self.fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames}')
 
         self.data[name][episode_indices, timestep_index] = datapoints
 
@@ -928,7 +1025,8 @@ class ReplayBuffer:
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
-        assert name in self.meta_fieldnames, f'invalid field name {name} - must be one of {self.meta_fieldnames}'
+        if name not in self.meta_fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.meta_fieldnames}')
 
         self.meta_data[name][episode_indices] = datapoints
 
@@ -979,9 +1077,10 @@ class ReplayBuffer:
         **data
     ):
         if not self.is_new_episode:
-            logger.warning(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
+            warnings.warn(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
 
-        assert len(data) > 0, 'No data provided to `store_episode`'
+        if len(data) == 0:
+            raise ValueError('No data provided to `store_episode`')
 
         # lazy init uninitialized episode
         self._lazy_init_episodes(np.array([self.episode_index]))
@@ -1003,7 +1102,8 @@ class ReplayBuffer:
             is_time_varying = name in self.fieldnames
             is_meta = name in self.meta_fieldnames
 
-            assert is_time_varying or is_meta, f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}'
+            if not (is_time_varying or is_meta):
+                raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}')
 
             if is_time_varying:
                 curr_time_dim = value.shape[0]
@@ -1011,12 +1111,14 @@ class ReplayBuffer:
                 if not exists(time_dim):
                     time_dim = curr_time_dim
 
-                assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
+                if time_dim != curr_time_dim:
+                    raise ValueError(f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}')
 
                 # auto-squeeze/unsqueeze logic for shapes () and (1,)
                 value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
 
-                assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+                if value.shape[1:] != self.shapes[name]:
+                    raise ValueError(f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}')
 
                 if time_dim > self.max_timesteps:
                     raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
@@ -1028,10 +1130,13 @@ class ReplayBuffer:
                 target_shape = self.shapes[name] if name in self.shapes else self.meta_shapes[name]
                 value = cast_to_target_shape(value, target_shape, is_time_varying = False)
 
-                assert value.shape == self.meta_shapes[name], f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}'
+                if value.shape != self.meta_shapes[name]:
+                    raise ValueError(f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}')
+
                 self.meta_data[name][self.episode_index] = value
 
-        assert exists(time_dim), 'At least one time-varying field must be provided to store_episode'
+        if not exists(time_dim):
+            raise ValueError('At least one time-varying field must be provided to store_episode')
 
         self.timestep_index = time_dim
         self.advance_episode()
@@ -1043,7 +1148,8 @@ class ReplayBuffer:
         indices: int | list | ndarray | slice | None = None,
         **data
     ):
-        assert len(data) > 0
+        if len(data) == 0:
+            raise ValueError('No data provided to `update`')
 
         # normalize indices
 
@@ -1076,11 +1182,16 @@ class ReplayBuffer:
             is_time_varying = name in self.fieldnames
             is_meta = name in self.meta_fieldnames
 
-            assert is_time_varying or is_meta, f'invalid field name `{name}`'
+            if not (is_time_varying or is_meta):
+                raise ValueError(f'invalid field name `{name}`')
 
             if is_time_varying:
-                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
                 time_dim = value.shape[1]
+                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
+
+                if time_dim > self.max_timesteps:
+                    raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
                 self.data[name][indices, :time_dim] = value
 
             elif is_meta:
@@ -1144,8 +1255,12 @@ class ReplayBuffer:
         **kwargs
     ) -> Dataset:
         self.flush()
-        assert len(self) > 0, 'replay buffer is empty'
-        assert not (exists(n_steps) and timestep_level), 'cannot specify both n_steps and timestep_level'
+
+        if len(self) == 0:
+            raise ValueError('replay buffer is empty')
+
+        if exists(n_steps) and timestep_level:
+            raise ValueError('cannot specify both n_steps and timestep_level')
 
         if exists(n_steps):
             return ReplayDatasetNStep(
@@ -1199,18 +1314,25 @@ class ReplayBuffer:
         to_named_tuple: tuple[str, ...] | None = None,
         shuffle = False,
         device: torch.device | str | None = None,
-        dataset_kwargs: dict = {},
+        dataset_kwargs: dict | None = None,
         **kwargs
     ) -> DataLoader:
+        dataset_kwargs = default(dataset_kwargs, dict())
+
         self.flush()
-        assert len(self) > 0, 'replay buffer is empty'
+
+        if len(self) == 0:
+            raise ValueError('replay buffer is empty')
 
         # if to_named_tuple is specified, don't filter dataset fields
-        if exists(to_named_tuple):
-            assert not exists(fields), 'cannot specify both fields and to_named_tuple'
+        if exists(to_named_tuple) and exists(fields):
+            raise ValueError('cannot specify both fields and to_named_tuple')
 
-        assert not (return_mask and (timestep_level or exists(n_steps))), 'return_mask is only supported for trajectory-level data'
-        assert not (exists(n_steps) and timestep_level), 'cannot specify both n_steps and timestep_level'
+        if return_mask and (timestep_level or exists(n_steps)):
+            raise ValueError('return_mask is only supported for trajectory-level data')
+
+        if exists(n_steps) and timestep_level:
+            raise ValueError('cannot specify both n_steps and timestep_level')
 
         if not exists(dataset):
             dataset = self.dataset(
@@ -1259,7 +1381,8 @@ class ReplayBuffer:
 
             if exists(to_named_tuple):
                 for field in to_named_tuple:
-                    assert field in batch, f'field `{field}` not found in batch. available fields: {list(batch.keys())}'
+                    if field not in batch:
+                        raise ValueError(f'field `{field}` not found in batch. available fields: {list(batch.keys())}')
 
                 batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(to_named_tuple, sanitized_fields)})
 

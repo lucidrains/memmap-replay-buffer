@@ -1,7 +1,8 @@
-import pytest
 import torch
+
 from memmap_replay_buffer import ReplayBuffer
 from memmap_replay_buffer.replay_buffer import ReplayDatasetTimeWindow
+
 
 def test_replay_dataset_time_window(tmp_path):
     replay = ReplayBuffer(

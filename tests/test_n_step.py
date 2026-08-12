@@ -1,10 +1,10 @@
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
-from pathlib import Path
-import shutil
 
 from memmap_replay_buffer import ReplayBuffer
+
 
 @pytest.fixture
 def buffer(tmp_path):
@@ -196,7 +196,7 @@ def test_filter_fields_scalar(buffer):
 def test_filter_fields_rejects_multidim(buffer):
     """filter_fields must reject non-scalar fields."""
 
-    with pytest.raises(AssertionError, match = 'scalar'):
+    with pytest.raises(ValueError, match = 'scalar'):
         buffer.dataset(
             n_steps = 2,
             current_fields = ('obs',),

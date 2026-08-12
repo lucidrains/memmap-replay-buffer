@@ -1,14 +1,11 @@
 from __future__ import annotations
-from typing import Any, Sequence
+
 from collections import defaultdict
 
 import numpy as np
-from numpy import ndarray
-
-import torch
-from torch import Tensor, cat, is_tensor
-
 from beartype import beartype
+from numpy import ndarray
+from torch import cat, is_tensor, stack
 
 from memmap_replay_buffer.replay_buffer import ReplayBuffer
 from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY
@@ -33,10 +30,10 @@ def is_group_batched(value, num_groups):
 def combine_trajectory(values):
     first = values[0]
     if is_tensor(first):
-        return cat(values, dim = 0)
+        return stack(values) if first.ndim == 0 else cat(values, dim = 0)
 
     if isinstance(first, ndarray):
-        return np.concatenate(values, axis = 0)
+        return np.stack(values) if first.ndim == 0 else np.concatenate(values, axis = 0)
 
     return np.array(values)
 

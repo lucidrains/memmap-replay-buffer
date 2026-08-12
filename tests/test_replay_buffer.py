@@ -1,12 +1,14 @@
-import pytest
-import torch
 from pathlib import Path
 
-def test_replay():
+import pytest
+import torch
+
+
+def test_replay(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
 
     replay_buffer = ReplayBuffer(
-        './replay_data',
+        tmp_path,
         max_episodes = 10_000,
         max_timesteps = 501,
         fields = dict(
@@ -50,33 +52,148 @@ def test_replay():
 
     assert next(iter(dataloader))['state'].shape[0] == 3
 
-def test_read_only():
+def test_read_only(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
 
     buffer = ReplayBuffer(
-        './test_read_only_data',
+        tmp_path,
         max_episodes = 10,
         max_timesteps = 10,
         fields = dict(state = 'float'),
-        read_only = True
     )
 
-    with pytest.raises(AssertionError):
+    with buffer.one_episode():
         buffer.store(state = 1.0)
 
-    with pytest.raises(AssertionError):
-        buffer.clear()
+    read_only_buffer = ReplayBuffer.from_folder(tmp_path, read_only = True)
 
-def test_store_batch():
+    assert read_only_buffer.num_episodes == 1
+
+    with pytest.raises(ValueError):
+        read_only_buffer.store(state = 1.0)
+
+    with pytest.raises(ValueError):
+        read_only_buffer.clear()
+
+def test_read_only_does_not_create_files(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
-    import shutil
 
-    folder = './test_batch_data'
-    if shutil.os.path.exists(folder):
-        shutil.rmtree(folder)
+    with pytest.raises(AssertionError):
+        ReplayBuffer(
+            tmp_path / 'nonexistent',
+            max_episodes = 10,
+            max_timesteps = 10,
+            fields = dict(state = 'float'),
+            read_only = True
+        )
+
+    empty_folder = tmp_path / 'empty'
+    empty_folder.mkdir()
+
+    with pytest.raises(AssertionError):
+        ReplayBuffer(
+            empty_folder,
+            max_episodes = 10,
+            max_timesteps = 10,
+            fields = dict(state = 'float'),
+            read_only = True
+        )
+
+    assert list(empty_folder.iterdir()) == []
+
+def test_config_mismatch(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
+    ReplayBuffer(
+        tmp_path,
+        max_episodes = 10,
+        max_timesteps = 10,
+        fields = dict(state = 'float'),
+    )
+
+    with pytest.raises(ValueError, match = 'different config'):
+        ReplayBuffer(
+            tmp_path,
+            max_episodes = 20,
+            max_timesteps = 10,
+            fields = dict(state = 'float'),
+            overwrite = False
+        )
+
+    with pytest.raises(ValueError, match = 'different config'):
+        ReplayBuffer(
+            tmp_path,
+            max_episodes = 10,
+            max_timesteps = 10,
+            fields = dict(state = 'float', action = 'int'),
+            overwrite = False
+        )
+
+    # overwrite = True should recreate fine
+    ReplayBuffer(
+        tmp_path,
+        max_episodes = 20,
+        max_timesteps = 10,
+        fields = dict(state = 'float'),
+        overwrite = True
+    )
+
+def test_from_folder_missing(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
+    with pytest.raises(ValueError, match = 'metadata.pkl'):
+        ReplayBuffer.from_folder(tmp_path / 'missing')
+
+def test_one_episode_rolls_back_on_error(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
 
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
+        max_episodes = 4,
+        max_timesteps = 10,
+        fields = dict(state = 'float', action = 'int'),
+    )
+
+    with pytest.raises(ValueError, match = 'max_timesteps'), buffer.one_episode():
+        for _ in range(10):
+            buffer.store(state = 1.0, action = 0)
+        buffer.store(state = 2.0, action = 1)  # 11th timestep exceeds max_timesteps
+
+    # the abandoned episode must not pollute the next one
+    with buffer.one_episode():
+        buffer.store(state = 3.0, action = 2)
+        buffer.store(state = 4.0, action = 3)
+
+    assert buffer.num_episodes == 1
+
+    data = buffer.get_all_data()
+
+    assert torch.all(data['state'][0, :2] == torch.tensor([3., 4.]))
+    assert torch.all(data['action'][0, :2] == torch.tensor([2, 3]))
+
+def test_store_batch_max_timesteps(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
+    buffer = ReplayBuffer(
+        tmp_path,
+        max_episodes = 5,
+        max_timesteps = 3,
+        fields = dict(state = 'float'),
+        circular = True
+    )
+
+    with buffer.batched_episode(batch_size = 2):
+        for _ in range(3):
+            buffer.store_batch(state = torch.randn(2))
+
+        with pytest.raises(ValueError, match = 'max_timesteps'):
+            buffer.store_batch(state = torch.randn(2))
+
+def test_store_batch(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
+    buffer = ReplayBuffer(
+        tmp_path,
         max_episodes = 5,
         max_timesteps = 1,
         fields = dict(state = 'float'),
@@ -98,10 +215,11 @@ def test_store_batch():
         buffer.store_batch(state = torch.randn(1))
         buffer.advance_episode(1)
 
-    # 4. Circular buffer wrap-around
-    shutil.rmtree(folder)
+def test_store_batch_circular(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes = 5,
         max_timesteps = 5,
         fields = dict(state = 'float'),
@@ -125,20 +243,15 @@ def test_store_batch():
     # Check meta batch (indices 0, 1, 2)
     assert torch.all(data['label'][:3] == torch.tensor([1, 2, 3]))
 
-    # Check first data batch (indices 0, 1) - wait, indices were 0, 1, 2 for label, then 2 for state advanced 3.
-    # Actually 0, 1, 2 were label stored at ep 0, 1, 2.
-    # Then store_batch state ones(2) at ep 0, 1.
-    # Then advance_episode(3) -> episode_index is 3.
-    # Then store_batch zeros(2) at ep 3, 4.
-
     # Check data storage
     assert torch.all(data['state'][:2, 0] == 1)
     assert torch.all(data['state'][3:5, 2] == 0)
 
-    # 6. Verify robust batch computation
-    shutil.rmtree(folder)
+def test_store_batch_validation(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes = 5,
         max_timesteps = 5,
         fields = dict(state = 'float'),
@@ -152,32 +265,33 @@ def test_store_batch():
     assert torch.all(buffer.get_all_data(meta_fields = ('label',))['label'][:3] == torch.tensor([1, 2, 3]))
 
     # Test empty data assertion
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         buffer.store_batch()
 
-    # Test mismatched batch size assertion
+    # Test mismatched batch size
     buffer = ReplayBuffer(
-        folder,
+        tmp_path / 'validation',
         max_episodes = 5,
         max_timesteps = 5,
         fields = dict(state = 'float', action = 'int'),
         circular = True
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         buffer.store_batch(state = torch.ones(3), action = torch.zeros(2))
 
-    # Test invalid field name assertion
-    with pytest.raises(AssertionError):
+    # Test invalid field name
+    with pytest.raises(ValueError):
         buffer.store_batch(invalid_field = torch.ones(3))
 
-    # Test invalid meta field name assertion
-    with pytest.raises(AssertionError):
+    # Test invalid meta field name
+    with pytest.raises(ValueError):
         buffer.store_meta_batch(invalid_meta = torch.tensor([1, 2, 3]))
 
-    # 7. Test batched_episode context manager
-    shutil.rmtree(folder)
+def test_batched_episode_context(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
+
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes = 10,
         max_timesteps = 5,
         fields = dict(state = 'float'),
@@ -198,22 +312,16 @@ def test_store_batch():
     assert torch.all(data['state'][:3, 1] == 0)
     assert (torch.from_numpy(buffer.episode_lens[:3].copy()) == 2).all()
 
-def test_consistency():
-    from memmap_replay_buffer import ReplayBuffer
-    import shutil
-    import torch
+def test_consistency(tmp_path: Path):
     import numpy as np
 
-    folder_seq = './test_seq'
-    folder_batch = './test_batch'
+    from memmap_replay_buffer import ReplayBuffer
 
-    for f in (folder_seq, folder_batch):
-        if shutil.os.path.exists(f):
-            shutil.rmtree(f)
+    folder_seq = tmp_path / 'seq'
+    folder_batch = tmp_path / 'batch'
 
     max_episodes = 5
     max_timesteps = 5
-    batch_size = 3
     total_episodes = 8 # 8 > 5, so will wrap around
 
     fields = dict(state = 'float', action = 'int')
@@ -228,8 +336,6 @@ def test_consistency():
 
     # 2. Batched Buffer
     buffer_batch = ReplayBuffer(folder_batch, max_episodes, max_timesteps, fields, circular = True)
-
-    # store 2 batches of 3, then one batch of 2
 
     # Batch 1 (eps 0, 1, 2)
     with buffer_batch.batched_episode(batch_size = 3):
@@ -266,22 +372,13 @@ def test_consistency():
     assert buffer_seq.episode_index == buffer_batch.episode_index
     assert buffer_seq.num_episodes == buffer_batch.num_episodes
 
-    # cleanup
-    shutil.rmtree(folder_seq)
-    shutil.rmtree(folder_batch)
-
-def test_update():
-    from memmap_replay_buffer import ReplayBuffer
-    import shutil
-    import torch
+def test_update(tmp_path: Path):
     import numpy as np
 
-    folder = './test_update'
-    if shutil.os.path.exists(folder):
-        shutil.rmtree(folder)
+    from memmap_replay_buffer import ReplayBuffer
 
     buf = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes = 5,
         max_timesteps = 20,
         fields = dict(
@@ -325,19 +422,32 @@ def test_update():
     buf.update(np.array([0]), returns=partial)
     assert np.allclose(buf.data['returns'][0, 4], partial[0, 4].item(), atol=1e-6)
 
-    shutil.rmtree(folder)
-
-def test_slice_by_episode_len():
-    from memmap_replay_buffer import ReplayBuffer
-    import shutil
+def test_update_exceeds_max_timesteps(tmp_path: Path):
     import torch
 
-    folder = './test_slice'
-    if shutil.os.path.exists(folder):
-        shutil.rmtree(folder)
+    from memmap_replay_buffer import ReplayBuffer
+
+    buf = ReplayBuffer(
+        tmp_path,
+        max_episodes = 2,
+        max_timesteps = 3,
+        fields = dict(state = 'float'),
+        circular = True,
+        overwrite = True
+    )
+
+    with buf.one_episode():
+        for _ in range(3):
+            buf.store(state = 0.)
+
+    with pytest.raises(ValueError, match = 'max_timesteps'):
+        buf.update(0, state = torch.randn(5))
+
+def test_slice_by_episode_len(tmp_path: Path):
+    from memmap_replay_buffer import ReplayBuffer
 
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes = 2,
         max_timesteps = 10,
         fields = dict(state = 'float'),
@@ -355,13 +465,11 @@ def test_slice_by_episode_len():
     dataset_unsliced = buffer.dataset(slice_by_episode_len=False)
     assert dataset_unsliced[0]['state'].shape[0] == 10
 
-    shutil.rmtree(folder)
-
-def test_return_episode_lens():
+def test_return_episode_lens(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
 
     replay_buffer = ReplayBuffer(
-        './replay_data_lens',
+        tmp_path,
         max_episodes = 10,
         max_timesteps = 10,
         fields = dict(
@@ -379,15 +487,14 @@ def test_return_episode_lens():
     dataset_without_lens = replay_buffer.dataset(return_episode_lens=False)
     assert '_lens' not in dataset_without_lens[0]
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         replay_buffer.dataset(slice_by_episode_len=False, return_episode_lens=False)
 
-def test_slice_by_episode_len_multiple_fields():
+def test_slice_by_episode_len_multiple_fields(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
-    import torch
 
     replay_buffer = ReplayBuffer(
-        './replay_data_slice_multiple',
+        tmp_path,
         max_episodes = 10,
         max_timesteps = 10,
         fields = dict(
@@ -434,7 +541,8 @@ def test_slice_by_episode_len_multiple_fields():
 
 def test_concat_replay_buffer(tmp_path: Path):
     import numpy as np
-    from memmap_replay_buffer import ReplayBuffer, ConcatReplayBuffer
+
+    from memmap_replay_buffer import ConcatReplayBuffer, ReplayBuffer
 
     folder1 = tmp_path / "buf1"
     folder2 = tmp_path / "buf2"
@@ -455,7 +563,7 @@ def test_concat_replay_buffer(tmp_path: Path):
     )
 
     # Store 1 episode in buf1
-    with buf1.one_episode(reward_sum=1.0) as meta:
+    with buf1.one_episode(reward_sum=1.0):
         for t in range(5):
             buf1.store(
                 state=np.array([1, 1, 1, 1]) * t,
@@ -479,7 +587,7 @@ def test_concat_replay_buffer(tmp_path: Path):
     )
 
     # Store 2 episodes in buf2
-    with buf2.one_episode(reward_sum=2.0) as meta:
+    with buf2.one_episode(reward_sum=2.0):
         for t in range(8):
             buf2.store(
                 state=np.array([2, 2, 2, 2]) * t,
@@ -487,7 +595,7 @@ def test_concat_replay_buffer(tmp_path: Path):
                 reward=2.0
             )
 
-    with buf2.one_episode(reward_sum=3.0) as meta:
+    with buf2.one_episode(reward_sum=3.0):
         for t in range(3):
             buf2.store(
                 state=np.array([3, 3, 3, 3]) * t,
@@ -497,7 +605,7 @@ def test_concat_replay_buffer(tmp_path: Path):
 
     # Create a completely empty buffer
     folder4 = tmp_path / "buf4"
-    buf4 = ReplayBuffer(
+    ReplayBuffer(
         folder=folder4,
         max_episodes=2,
         max_timesteps=10,
@@ -576,37 +684,32 @@ def test_concat_replay_buffer(tmp_path: Path):
         )
     )
 
-    with buf3.one_episode(reward_sum=1.0) as meta:
+    with buf3.one_episode(reward_sum=1.0):
         for t in range(5):
             buf3.store(state=np.array([1, 1, 1, 1]) * t, action=0, reward=1.0)
 
-    with buf3.one_episode(reward_sum=2.0) as meta:
+    with buf3.one_episode(reward_sum=2.0):
         for t in range(8):
             buf3.store(state=np.array([2, 2, 2, 2]) * t, action=1, reward=2.0)
 
-    with buf3.one_episode(reward_sum=3.0) as meta:
+    with buf3.one_episode(reward_sum=3.0):
         for t in range(3):
             buf3.store(state=np.array([3, 3, 3, 3]) * t, action=2, reward=3.0)
 
     all_data_buf3 = buf3.get_all_data()
 
-    for k in all_data.keys():
+    for k in all_data:
         assert torch.allclose(all_data[k], all_data_buf3[k])
 
     # test write guard
     with pytest.raises(NotImplementedError):
         concat_buf.clear()
 
-def test_store_meta_after_episode():
+def test_store_meta_after_episode(tmp_path: Path):
     from memmap_replay_buffer import ReplayBuffer
-    import shutil
-
-    folder = './test_meta_after_episode'
-    if shutil.os.path.exists(folder):
-        shutil.rmtree(folder)
 
     buffer = ReplayBuffer(
-        folder,
+        tmp_path,
         max_episodes=1,
         max_timesteps=10,
         fields=dict(reward='float'),
@@ -627,8 +730,9 @@ def test_store_meta_after_episode():
     assert torch.all(data['reward'] == 1.0), "Data was improperly zeroed out!"
     assert data['cum_reward'].item() == 5.0
 
-def test_del_flushes_buffer(tmp_path):
+def test_del_flushes_buffer(tmp_path: Path):
     import gc
+
     from memmap_replay_buffer import ReplayBuffer
 
     def create_and_destroy_buffer():

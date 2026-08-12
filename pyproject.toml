@@ -1,12 +1,12 @@
 [project]
 name = "memmap-replay-buffer"
-version = "0.1.11"
+version = "0.2.0"
 description = "Simple Replay Buffer for RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">= 3.9"
+requires-python = ">= 3.10"
 license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
@@ -18,18 +18,15 @@ classifiers=[
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
-    'License :: OSI Approved :: MIT License',
-    'Programming Language :: Python :: 3.9',
+    'License :: OSI Approved :: MIT License'
 ]
 
 dependencies = [
     "beartype",
-    "einx>=0.4.0",
     "einops>=0.8.1",
-    "loguru",
+    "einx>=0.4.0",
     "numpy",
-    "torch>=2.5",
-    "torch-einops-utils>=0.0.34"
+    "torch>=2.4"
 ]
 
 [project.urls]
@@ -37,7 +34,6 @@ Homepage = "https://pypi.org/project/memmap-replay-buffer/"
 Repository = "https://codeberg.org/lucidrains/memmap-replay-buffer"
 
 [project.optional-dependencies]
-examples = []
 test = [
     "pytest",
     "h5py"
@@ -55,15 +51,11 @@ testpaths = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.rye]
-managed = true
-dev-dependencies = []
-
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["memmap_replay_buffer", "tests"]
+packages = ["memmap_replay_buffer"]
 
 [tool.hatch.build.targets.sdist]
 include = [

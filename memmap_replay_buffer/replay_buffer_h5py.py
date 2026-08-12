@@ -1,39 +1,36 @@
 from __future__ import annotations
-import h5py
+
 import pickle
 import warnings
-import numpy as np
-from pathlib import Path
-from collections import namedtuple, defaultdict
+from collections import defaultdict, namedtuple
 from contextlib import contextmanager, suppress
-
 from functools import partial
+from pathlib import Path
+
 import einx
-import beartype
+import h5py
+import numpy as np
+import torch
 from beartype import beartype
 from beartype.door import is_bearable
-from beartype.typing import Literal
-
-import torch
-from torch import tensor, from_numpy as torch_from_numpy, stack, is_tensor, Tensor, arange
-from torch.utils.data import Dataset, DataLoader, default_collate
+from beartype.typing import Any
+from numpy import ndarray
+from torch import Tensor, arange, is_tensor, tensor
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 from memmap_replay_buffer.replay_buffer import (
-    exists,
-    default,
-    first,
-    cast_to_target_shape,
-    xnor,
-    is_empty,
-    divisible_by,
-    from_numpy,
-    can_write,
-    ReplayDatasetTrajectory,
-    ReplayDatasetTimestep,
     FieldInfo,
     PrimitiveType,
+    ReplayDatasetTimestep,
+    ReplayDatasetTrajectory,
+    can_write,
+    cast_to_target_shape,
     collate_var_time,
-    tree_map_to_device
+    default,
+    divisible_by,
+    exists,
+    from_numpy,
+    tree_map_to_device,
 )
 
 # h5py dataset proxy
@@ -95,7 +92,7 @@ class ReplayBufferH5PY:
         max_episodes: int,
         max_timesteps: int,
         fields: dict[str, FieldInfo],
-        meta_fields: dict[str, FieldInfo] = dict(),
+        meta_fields: dict[str, FieldInfo] | None = None,
         circular = False,
         overwrite = True,
         read_only = False,
@@ -103,20 +100,40 @@ class ReplayBufferH5PY:
         h5py_compression: str | None = None,
         h5py_compression_opts: int | Any | None = None
     ):
+        meta_fields = default(meta_fields, dict())
+
         self.read_only = read_only
+
+        assert not (read_only and overwrite), 'cannot overwrite a buffer in read-only mode'
 
         # folder for data
 
         if not isinstance(folder, Path):
             folder = Path(folder)
 
-        folder.mkdir(exist_ok = True, parents = True)
+        if read_only:
+            assert folder.is_dir(), f'cannot open folder `{folder}` in read-only mode - folder does not exist'
+        else:
+            folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
         assert folder.is_dir()
 
         self.h5_path = folder / 'data.h5'
         self.config_path = folder / 'metadata.pkl'
+
+        if self.config_path.exists() and not overwrite:
+            with open(str(self.config_path), 'rb') as f:
+                stored_config = pickle.load(f)
+
+            init_locals = locals()
+
+            mismatched_keys = [key for key, value in stored_config.items() if init_locals[key] != value]
+
+            if len(mismatched_keys) > 0:
+                mismatch_lines = [f'  {key}: stored {stored_config[key]!r} vs passed {init_locals[key]!r}' for key in mismatched_keys]
+                mismatch_str = '\n'.join(mismatch_lines)
+                raise ValueError(f'buffer at `{folder}` was created with a different config:\n{mismatch_str}\nPass `overwrite = True` to recreate the buffer with the new config.')
 
         if not self.config_path.exists() or overwrite:
             config = dict(
@@ -134,23 +151,24 @@ class ReplayBufferH5PY:
 
         # open hdf5 file
 
-        mode = 'w' if overwrite or not self.h5_path.exists() else ('r' if read_only else 'r+')
+        if read_only:
+            assert self.h5_path.exists(), f'data.h5 not found in `{folder}` - cannot open in read-only mode'
+            mode = 'r'
+        else:
+            mode = 'w' if overwrite or not self.h5_path.exists() else 'r+'
+
         self.file = h5py.File(str(self.h5_path), mode)
 
         if overwrite:
-            for key in self.file.keys():
+            for key in list(self.file):
                 del self.file[key]
 
-            for key in self.file.attrs.keys():
+            for key in list(self.file.attrs):
                 del self.file.attrs[key]
 
         # state management
 
-        if overwrite:
-            self.file.attrs['num_episodes'] = 0
-            self.file.attrs['episode_index'] = 0
-            self.file.attrs['timestep_index'] = 0
-        elif 'num_episodes' not in self.file.attrs:
+        if overwrite or 'num_episodes' not in self.file.attrs:
             self.file.attrs['num_episodes'] = 0
             self.file.attrs['episode_index'] = 0
             self.file.attrs['timestep_index'] = 0
@@ -229,7 +247,8 @@ class ReplayBufferH5PY:
         self.defaults = dict()
         self.fieldnames = set(fields.keys())
 
-        assert self.fieldnames.isdisjoint(self.meta_fieldnames), f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}'
+        if not self.fieldnames.isdisjoint(self.meta_fieldnames):
+            raise ValueError(f'fields and meta_fields must be disjoint - shared {self.fieldnames & self.meta_fieldnames}')
 
         for field_name, field_info in fields.items():
             dtype, shape, default_value = parse_field_info(field_info)
@@ -326,7 +345,8 @@ class ReplayBufferH5PY:
         if self.is_new_episode and batch_size == 1:
             return
 
-        assert self.circular or self.num_episodes + batch_size <= self.max_episodes
+        if not self.circular and self.num_episodes + batch_size > self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
 
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
@@ -371,10 +391,13 @@ class ReplayBufferH5PY:
 
     @can_write
     def _store_batch(self, data: dict[str, Tensor | ndarray | list | tuple], is_meta = False):
-        assert len(data) > 0
+        if len(data) == 0:
+            raise ValueError(f'No data provided to {"store_meta_batch" if is_meta else "store_batch"}')
 
         fieldnames = self.meta_fieldnames if is_meta else self.fieldnames
-        assert set(data.keys()).issubset(fieldnames)
+
+        if not set(data.keys()).issubset(fieldnames):
+            raise ValueError(f'invalid {"meta " if is_meta else ""}field names {set(data.keys()) - fieldnames} - must be a subset of {fieldnames}')
 
         batch_size = None
 
@@ -388,7 +411,11 @@ class ReplayBufferH5PY:
             if not exists(batch_size):
                 batch_size = curr_batch_size
 
-            assert batch_size == curr_batch_size
+            if batch_size != curr_batch_size:
+                raise ValueError(f'All data in batch must have the same batch size. Field {key} has batch size {curr_batch_size} while previous fields had {batch_size}.')
+
+        if not is_meta and self.timestep_index >= self.max_timesteps:
+            raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
 
         if not self.circular:
             remaining = self.max_episodes - self.num_episodes
@@ -426,8 +453,10 @@ class ReplayBufferH5PY:
     def store_meta_batch(self, **data):
         return self._store_batch(data, is_meta = True)
 
-    @can_write
     def flush(self):
+        if self.read_only:
+            return
+
         if self.timestep_index > 0:
             self.episode_lens[self.episode_index] = self.timestep_index
 
@@ -446,7 +475,11 @@ class ReplayBufferH5PY:
 
         final_meta_data_store = dict()
 
-        yield final_meta_data_store
+        try:
+            yield final_meta_data_store
+        except Exception:
+            self.timestep_index = 0
+            raise
 
         for name, value in final_meta_data_store.items():
             self.store_meta_datapoint(self.episode_index, name, value)
@@ -466,28 +499,53 @@ class ReplayBufferH5PY:
         if len(meta_batch) > 0:
             self.store_meta_batch(**meta_batch)
 
-        yield
+        try:
+            yield
+        except Exception:
+            self.timestep_index = 0
+            raise
 
         self.flush()
         self.advance_episode(batch_size = batch_size)
 
     @can_write
     def store_datapoint(self, episode_index, timestep_index, name, datapoint):
+        if not (0 <= episode_index < self.max_episodes):
+            raise ValueError(f'episode_index {episode_index} out of range - must be in [0, {self.max_episodes})')
+
+        if not (0 <= timestep_index < self.max_timesteps):
+            raise ValueError(f'timestep_index {timestep_index} out of range - must be in [0, {self.max_timesteps})')
+
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
         if is_bearable(datapoint, PrimitiveType):
             datapoint = np.array(datapoint)
+
+        if name not in self.fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames}')
+
+        if datapoint.shape != self.shapes[name]:
+            raise ValueError(f'field {name} - invalid shape {datapoint.shape} - shape must be {self.shapes[name]}')
 
         self.data[name][episode_index, timestep_index] = datapoint
 
     @can_write
     def store_meta_datapoint(self, episode_index, name, datapoint):
+        if not (0 <= episode_index < self.max_episodes):
+            raise ValueError(f'episode_index {episode_index} out of range - must be in [0, {self.max_episodes})')
+
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
 
         if is_bearable(datapoint, PrimitiveType):
             datapoint = np.array(datapoint)
+
+        if name not in self.meta_fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.meta_fieldnames}')
+
+        if datapoint.shape != self.meta_shapes[name]:
+            raise ValueError(f'field {name} - invalid shape {datapoint.shape} - shape must be {self.meta_shapes[name]}')
 
         self.meta_data[name][episode_index] = datapoint
 
@@ -496,12 +554,18 @@ class ReplayBufferH5PY:
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
 
+        if name not in self.fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames}')
+
         self.data[name][episode_indices, timestep_index] = datapoints
 
     @can_write
     def store_batch_meta_datapoint(self, episode_indices, name, datapoints):
         if is_tensor(datapoints):
             datapoints = datapoints.detach().cpu().numpy()
+
+        if name not in self.meta_fieldnames:
+            raise ValueError(f'invalid field name {name} - must be one of {self.meta_fieldnames}')
 
         self.meta_data[name][episode_indices] = datapoints
     @can_write
@@ -547,7 +611,8 @@ class ReplayBufferH5PY:
         if not self.is_new_episode:
             warnings.warn(f'timestep index is not 0 ({self.timestep_index}) when calling `store_episode`. This will overwrite the current episode from the beginning.')
 
-        assert len(data) > 0, 'No data provided to `store_episode`'
+        if len(data) == 0:
+            raise ValueError('No data provided to `store_episode`')
 
         self._lazy_init_episodes(np.array([self.episode_index]))
 
@@ -568,7 +633,8 @@ class ReplayBufferH5PY:
             is_time_varying = name in self.fieldnames
             is_meta = name in self.meta_fieldnames
 
-            assert is_time_varying or is_meta, f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}'
+            if not (is_time_varying or is_meta):
+                raise ValueError(f'invalid field name {name} - must be one of {self.fieldnames} or {self.meta_fieldnames}')
 
             if is_time_varying:
                 curr_time_dim = value.shape[0]
@@ -576,12 +642,14 @@ class ReplayBufferH5PY:
                 if not exists(time_dim):
                     time_dim = curr_time_dim
 
-                assert time_dim == curr_time_dim, f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}'
+                if time_dim != curr_time_dim:
+                    raise ValueError(f'all fields must have the same time dimension. field {name} has {curr_time_dim} while previous fields had {time_dim}')
 
                 # auto-squeeze/unsqueeze logic for shapes () and (1,)
                 value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
 
-                assert value.shape[1:] == self.shapes[name], f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}'
+                if value.shape[1:] != self.shapes[name]:
+                    raise ValueError(f'field {name} - invalid shape {value.shape[1:]} - shape must be {self.shapes[name]}')
 
                 if time_dim > self.max_timesteps:
                     raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
@@ -593,13 +661,80 @@ class ReplayBufferH5PY:
                 target_shape = self.shapes[name] if name in self.shapes else self.meta_shapes[name]
                 value = cast_to_target_shape(value, target_shape, is_time_varying = False)
 
-                assert value.shape == self.meta_shapes[name], f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}'
+                if value.shape != self.meta_shapes[name]:
+                    raise ValueError(f'meta field {name} - invalid shape {value.shape} - shape must be {self.meta_shapes[name]}')
+
                 self.meta_data[name][self.episode_index] = value
 
-        assert exists(time_dim), 'At least one time-varying field must be provided to store_episode'
+        if not exists(time_dim):
+            raise ValueError('At least one time-varying field must be provided to store_episode')
 
         self.timestep_index = time_dim
         self.advance_episode()
+
+    @can_write
+    def update(
+        self,
+        indices = None,
+        **data
+    ):
+        if len(data) == 0:
+            raise ValueError('No data provided to `update`')
+
+        # normalize indices
+
+        if not exists(indices):
+            indices = np.where(self.episode_lens[:] > 0)[0]
+            scalar_index = False
+        elif isinstance(indices, slice):
+            indices = np.arange(*indices.indices(self.max_episodes))
+            scalar_index = False
+        elif np.isscalar(indices):
+            indices = np.array([indices])
+            scalar_index = True
+        else:
+            indices = np.atleast_1d(np.asarray(indices))
+            scalar_index = False
+
+        for name, value in data.items():
+            if is_tensor(value):
+                value = value.detach().cpu().numpy()
+
+            if isinstance(value, (list, tuple)):
+                value = np.array(value)
+
+            if np.isscalar(value):
+                value = np.array(value)
+
+            if scalar_index:
+                value = np.expand_dims(value, 0)
+
+            is_time_varying = name in self.fieldnames
+            is_meta = name in self.meta_fieldnames
+
+            if not (is_time_varying or is_meta):
+                raise ValueError(f'invalid field name `{name}`')
+
+            if is_time_varying:
+                time_dim = value.shape[1]
+                value = cast_to_target_shape(value, self.shapes[name], is_time_varying = True)
+
+                if time_dim > self.max_timesteps:
+                    raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
+
+                if value.shape[0] == 1 and len(indices) > 1:
+                    value = np.repeat(value, len(indices), axis = 0)
+
+                for i, index in enumerate(indices):
+                    self.data[name][index, :time_dim] = value[i]
+
+            elif is_meta:
+                target_shape = self.meta_shapes[name]
+                value = cast_to_target_shape(value, target_shape, is_time_varying = False)
+                self.meta_data[name][indices] = value
+
+        if self.should_flush:
+            self.flush()
 
     def get_all_data(
         self,
@@ -640,9 +775,16 @@ class ReplayBufferH5PY:
         filter_meta = None,
         filter_fields = None,
         fieldname_map = None,
+        n_steps = None,
         **kwargs
     ) -> Dataset:
         self.flush()
+
+        if len(self) == 0:
+            raise ValueError('replay buffer is empty')
+
+        if exists(n_steps):
+            raise ValueError('n_steps is not supported by ReplayBufferH5PY - use the memmap ReplayBuffer')
 
         dataset_klass = ReplayDatasetTimestep if timestep_level else ReplayDatasetTrajectory
 
@@ -659,10 +801,13 @@ class ReplayBufferH5PY:
         storage = defaultdict(list)
 
         def buffered_storer(force_flush = False, **data):
-            assert not self.read_only, 'cannot write to read-only buffer'
+            if self.read_only:
+                raise ValueError('cannot write to read-only buffer')
 
             for key, value in data.items():
-                assert key in self.fieldnames or key in self.meta_fieldnames, f"Field {key} not found in buffer fields"
+                if key not in self.fieldnames and key not in self.meta_fieldnames:
+                    raise ValueError(f"Field {key} not found in buffer fields")
+
                 storage[key].append(value)
 
             if not (storage and (force_flush or len(next(iter(storage.values()))) >= flush_freq)):
@@ -672,7 +817,8 @@ class ReplayBufferH5PY:
             batch_size = len(next(iter(storage.values())))
 
             for k, v in storage.items():
-                assert len(v) == batch_size, f"Field {k} has different number of episodes in buffer ({len(v)}, expected {batch_size})"
+                if len(v) != batch_size:
+                    raise ValueError(f"Field {k} has different number of episodes in buffer ({len(v)}, expected {batch_size})")
 
             batch_data = {k: np.stack(v) for k, v in storage.items()}
 
@@ -698,17 +844,22 @@ class ReplayBufferH5PY:
         to_named_tuple: tuple[str, ...] | None = None,
         shuffle = False,
         device: torch.device | str | None = None,
-        dataset_kwargs: dict = {},
+        dataset_kwargs: dict | None = None,
         **kwargs
     ) -> DataLoader:
+        dataset_kwargs = default(dataset_kwargs, dict())
+
         self.flush()
-        assert len(self) > 0, 'replay buffer is empty'
+
+        if len(self) == 0:
+            raise ValueError('replay buffer is empty')
 
         # if to_named_tuple is specified, don't filter dataset fields
-        if exists(to_named_tuple):
-            assert not exists(fields), 'cannot specify both fields and to_named_tuple'
+        if exists(to_named_tuple) and exists(fields):
+            raise ValueError('cannot specify both fields and to_named_tuple')
 
-        assert not (return_mask and timestep_level), 'return_mask is only supported for trajectory-level data'
+        if return_mask and timestep_level:
+            raise ValueError('return_mask is only supported for trajectory-level data')
 
         if not exists(dataset):
             dataset = self.dataset(
@@ -753,7 +904,8 @@ class ReplayBufferH5PY:
 
             if exists(to_named_tuple):
                 for field in to_named_tuple:
-                    assert field in batch, f'field `{field}` not found in batch. available fields: {list(batch.keys())}'
+                    if field not in batch:
+                        raise ValueError(f'field `{field}` not found in batch. available fields: {list(batch.keys())}')
 
                 batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(to_named_tuple, sanitized_fields)})
 
@@ -779,7 +931,8 @@ class ReplayBufferH5PY:
     def _store_episodes_batch(self, data: dict[str, np.ndarray]):
         batch_size = next(iter(data.values())).shape[0]
 
-        assert self.circular or self.num_episodes + batch_size <= self.max_episodes, "Buffer full"
+        if not self.circular and self.num_episodes + batch_size > self.max_episodes:
+            raise ValueError(f'The replay buffer is full ({self.max_episodes} episodes) and is not set to be circular. Please set `circular = True` or clear the buffer.')
         indices = np.arange(self.episode_index, self.episode_index + batch_size) % self.max_episodes
 
         self._lazy_init_episodes(indices)
@@ -802,6 +955,9 @@ class ReplayBufferH5PY:
             folder = Path(folder)
 
         config_path = folder / 'metadata.pkl'
+
+        if not config_path.exists():
+            raise ValueError(f'metadata.pkl not found in {folder}')
 
         with open(str(config_path), 'rb') as f:
             config = pickle.load(f)

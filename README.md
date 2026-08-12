@@ -118,3 +118,73 @@ for state, next_state, action_chunk, rewards, n_step_lens in dataloader:
     assert rewards.shape == (4, 5)
     assert n_step_lens.shape == (4,)
 ```
+
+### Storing whole episodes
+
+`store_episode` takes one tensor per field, all sharing the same time dimension (meta fields are scalars or per-episode shapes).
+
+```python
+buffer.store_episode(
+    state = torch.randn(100, 3, 16, 16),
+    action = torch.randint(0, 4, (100, 2)),
+    reward = torch.randn(100),
+    task_id = 1
+)
+```
+
+### Batched parallel collection
+
+When collecting from multiple parallel environments, `batched_episode` + `store_batch` keeps every environment at the same timestep. `create_collector` additionally accumulates group-batched data and stores finished episodes for you.
+
+```python
+with buffer.batched_episode(batch_size = 4, task_id = [0, 1, 2, 3]):
+    for t in range(100):
+        buffer.store_batch(
+            state = states,     # (4, 3, 16, 16)
+            action = actions    # (4, 2)
+        )
+```
+
+### Updating data in place
+
+`update` overwrites already-stored episodes, e.g. for bootstrapped returns or value targets.
+
+```python
+buffer.update(returns = torch.randn(3, 100))            # all populated episodes
+buffer.update(episode_ids, returns = returns_for_ids)   # specific episodes
+buffer.update(0, returns = returns_for_one)             # scalar index
+```
+
+### Pulling everything at once
+
+```python
+all_data = buffer.get_all_data()  # dict of tensors, time-padded to the longest episode
+```
+
+### Reopening, read-only, and clearing
+
+`overwrite = False` (or `from_folder`) rehydrates an existing buffer from disk; the stored config is validated against the requested one, so mismatched `fields`/`max_episodes` raise a clear error. `read_only = True` guarantees no files are created or written. `clear()` wipes all episodes.
+
+```python
+buffer = ReplayBuffer.from_folder('./replay_data', read_only = True)
+buffer = ReplayBuffer('./replay_data', max_episodes = 1000, max_timesteps = 500, fields = ..., overwrite = False)
+buffer.clear()
+```
+
+### Concatenating buffers
+
+`ConcatReplayBuffer` combines several (read-only) buffers of identical fields into one dataset.
+
+```python
+from memmap_replay_buffer import ConcatReplayBuffer
+
+concat = ConcatReplayBuffer(['./replay_data_a', './replay_data_b'])
+dataloader = concat.dataloader(batch_size = 2, return_mask = True)
+```
+
+### Notes
+
+- `circular = True` overwrites the oldest episodes once the buffer is full; `circular = False` raises when full.
+- Fields missing from `store` are filled with their declared default value (or zeros).
+- `flush_every_store_step` controls how often the memmaps are flushed to disk while storing (default 1; raise it for faster collection at the cost of durability).
+- `ReplayBufferH5PY` (`pip install h5py`) is an HDF5-backed variant with the same interface, optionally gzip-compressed.
