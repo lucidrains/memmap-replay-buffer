@@ -917,15 +917,19 @@ class ReplayBufferH5PY:
         self,
         num_groups: int,
         fieldnames: tuple[str, ...] | None = None,
-        meta_fieldnames: tuple[str, ...] | None = None
+        meta_fieldnames: tuple[str, ...] | None = None,
+        **collector_kwargs
     ):
         from memmap_replay_buffer.episode_collector import EpisodeCollector
         return EpisodeCollector(
             self,
             num_groups,
             fieldnames = fieldnames,
-            meta_fieldnames = meta_fieldnames
+            meta_fieldnames = meta_fieldnames,
+            **collector_kwargs
         )
+
+    create_rollout_collector = create_collector
 
     @can_write
     def _store_episodes_batch(self, data: dict[str, np.ndarray]):

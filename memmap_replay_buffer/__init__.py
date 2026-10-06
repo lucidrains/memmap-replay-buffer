@@ -10,3 +10,5 @@ try:
     from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY as ReplayBufferH5PY
 except ImportError:
     pass
+
+from memmap_replay_buffer.episode_collector import EpisodeCollector as EpisodeCollector
