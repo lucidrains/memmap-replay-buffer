@@ -12,3 +12,5 @@ except ImportError:
     pass
 
 from memmap_replay_buffer.episode_collector import EpisodeCollector as EpisodeCollector
+from memmap_replay_buffer.video import frames_to_sheet as frames_to_sheet
+from memmap_replay_buffer.video import trajectory_to_video as trajectory_to_video

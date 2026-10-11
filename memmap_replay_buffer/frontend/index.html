@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>inspect-replay-buffer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: #0f1012;
+    color: #e8e8e8;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  video {
+    max-width: min(75vw, 1200px);
+    max-height: 88vh;
+    border-radius: 6px;
+    background: #000;
+  }
+  aside {
+    position: fixed;
+    top: 50%;
+    right: 20px;
+    transform: translateY(-50%);
+    width: 240px;
+    max-height: 88vh;
+    overflow: auto;
+    padding: 16px;
+    background: #17181b;
+    border: 1px solid #26282c;
+    border-radius: 6px;
+  }
+  aside h1 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: #7fb4e6; }
+  aside h2 { margin: 16px 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: #8a8f98; }
+  dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+  dt { color: #8a8f98; }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  #extras:empty { display: none; }
+  @media (max-width: 1000px) {
+    body { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 16px; }
+    video { max-width: 100%; }
+    aside { position: static; transform: none; width: 100%; max-width: 480px; }
+  }
+</style>
+</head>
+<body>
+  <video id="replay" src="/video" controls autoplay loop muted></video>
+  <aside>
+    <h1>replay buffer</h1>
+    <dl id="stats"></dl>
+    <h2>time</h2>
+    <dl>
+      <dt>frame</dt><dd id="frame">0</dd>
+    </dl>
+    <div id="extras"></div>
+  </aside>
+<script>
+  const stats = __REPLAY_STATS__;
+  const video = document.getElementById('replay');
+  const extras = document.getElementById('extras');
+
+  const statsList = document.getElementById('stats');
+  for (const [key, value] of Object.entries(stats)) {
+    const dt = document.createElement('dt');
+    dt.textContent = key;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    statsList.append(dt, dd);
+  }
+
+  const frameLabel = document.getElementById('frame');
+  const updateTime = () => {
+    frameLabel.textContent = `${Math.round(video.currentTime * stats.fps)} / ${stats.frames}`;
+  };
+  video.addEventListener('timeupdate', updateTime);
+  updateTime();
+
+  // future: sync value predictions / actions / other per-timestep elements to `video.currentTime`
+  window.replay = { stats, video, extras };
+</script>
+</body>
+</html>

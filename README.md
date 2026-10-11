@@ -161,6 +161,22 @@ buffer.update(0, returns = returns_for_one)             # scalar index
 all_data = buffer.get_all_data()  # dict of tensors, time-padded to the longest episode
 ```
 
+### Rendering an episode to video
+
+When a field holds one frame per timestep, `save_video` renders an episode to `.mp4` or `.gif` (needs `pip install memmap-replay-buffer[video]`). The image field is auto-detected, and frames may be `uint8` or float in `[0., 1.]`.
+
+```python
+buffer.save_video('./episode-0.mp4', episode_index = 0, fps = 30)
+```
+
+`trajectory_to_video(frames, path, fps)` is exported for plain `(time, height, width, channels)` arrays.
+
+The same is available from the command line, with `--sheet` for a contact sheet and `--serve` for a minimal local frontend (video centered, field stats and a live frame counter to the side).
+
+```bash
+$ inspect-replay-buffer ./image_data --episode 0 --output episode-0.mp4 --serve 8000
+```
+
 ### Reopening, read-only, and clearing
 
 `overwrite = False` (or `from_folder`) rehydrates an existing buffer from disk; the stored config is validated against the requested one, so mismatched `fields`/`max_episodes` raise a clear error. `read_only = True` guarantees no files are created or written. `clear()` wipes all episodes.
