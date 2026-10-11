@@ -34,6 +34,34 @@ def frames_to_sheet(frames: np.ndarray, rows = 2, columns = 5):
         for row in range(rows)
     ], axis = 0)
 
+def parse_episodes(value: str):
+    """ parse a comma-delimited episode list, e.g. `0,3,5` """
+    try:
+        episodes = [int(part) for part in value.split(',') if part.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'invalid episode list `{value}` - expected comma-delimited episode indices, e.g. `0,3,5`')
+
+    if not episodes:
+        raise argparse.ArgumentTypeError(f'invalid episode list `{value}` - expected at least one episode index')
+
+    return episodes
+
+def parse_fields(value: str):
+    """ parse a comma-delimited field list, e.g. `image,wrist` """
+    fields = [part.strip() for part in value.split(',') if part.strip()]
+
+    if not fields:
+        raise argparse.ArgumentTypeError(f'invalid field list `{value}` - expected at least one field name')
+
+    return fields
+
+def field_path(base: Path, field: str, multiple: bool):
+    """ with multiple fields, insert the field name before the suffix, e.g. `video.image.mp4` """
+    if not multiple:
+        return base
+
+    return base.with_name(f'{base.stem}.{field}{base.suffix}')
+
 # main
 
 def trajectory_to_video(
@@ -91,13 +119,13 @@ def open_buffer(folder: str | Path):
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog = 'inspect-replay-buffer',
-        description = 'render one episode of image frames stored in a replay buffer to a video (and optionally a contact sheet)'
+        description = 'render episodes of image frames stored in a replay buffer to videos (and optionally contact sheets)'
     )
     parser.add_argument('folder', help = 'replay buffer folder')
-    parser.add_argument('-e', '--episode', type = int, default = 0, help = 'episode (buffer row) to render')
-    parser.add_argument('-f', '--field', default = None, help = 'image field name - auto-detected if there is exactly one image-like field')
+    parser.add_argument('-e', '--episode', type = parse_episodes, default = [0], help = 'comma-delimited episode(s) (buffer rows) to render, e.g. `0,3,5`')
+    parser.add_argument('-f', '--field', type = parse_fields, default = None, help = 'comma-delimited image field name(s) - all image-like fields if omitted')
     parser.add_argument('--fps', type = int, default = 30, help = 'frames per second')
-    parser.add_argument('-o', '--output', default = None, help = 'output video path - defaults to `<folder>-episode-<n>.mp4`')
+    parser.add_argument('-o', '--output', default = None, help = 'output video path - with multiple fields each name is inserted before the suffix, e.g. `out.image.mp4`; defaults to `<folder>-episode-<n>.mp4`')
     parser.add_argument('--scale', type = int, default = 1, help = 'downsample frames by an integer factor')
     parser.add_argument('--sheet', default = None, help = 'also write a contact sheet of frames to this png path')
     parser.add_argument('--rows', type = int, default = 2, help = 'contact sheet rows')
@@ -107,54 +135,77 @@ def main(argv: list[str] | None = None):
 
     args = parser.parse_args(argv)
 
+    episodes = args.episode
+
     try:
         buffer = open_buffer(args.folder)
-        field = args.field or buffer.default_image_field()
-        frames = buffer.episode_frames(args.episode, field = field)
+        fields = args.field or buffer.image_fields()
+    except ValueError as e:
+        parser.error(str(e))
+
+    if not fields:
+        parser.error('no image-like field found - pass `--field` explicitly')
+
+    frames_by_field = dict()
+
+    try:
+        for field in fields:
+            frames_by_field[field] = buffer.episode_frames(episodes, field = field)
     except ValueError as e:
         parser.error(str(e))
 
     if args.scale > 1:
-        frames = frames[:, ::args.scale, ::args.scale]
+        frames_by_field = {field: frames[:, ::args.scale, ::args.scale] for field, frames in frames_by_field.items()}
 
+    multiple = len(fields) > 1
     temp_dir = None
 
     if args.output:
-        output = Path(args.output)
+        base = Path(args.output)
     elif args.serve is not None:
         temp_dir = Path(tempfile.mkdtemp(prefix = 'inspect-replay-buffer-'))
-        output = temp_dir / 'video.mp4'
+        base = temp_dir / 'video.mp4'
     else:
-        output = Path(f'{Path(args.folder).resolve().name}-episode-{args.episode}.mp4')
+        episode_slug = '-'.join(str(episode) for episode in episodes)
+        base = Path(f'{Path(args.folder).resolve().name}-episode-{episode_slug}.mp4')
 
-    path = trajectory_to_video(frames, output, fps = args.fps)
+    videos = dict()
 
-    print(f'wrote {path} ({len(frames)} frames of {frames.shape[1:]} at {args.fps} fps)')
+    for field, frames in frames_by_field.items():
+        path = trajectory_to_video(frames, field_path(base, field, multiple), fps = args.fps)
+        videos[field] = path
+
+        print(f'wrote {path} ({len(frames)} frames of {frames.shape[1:]} at {args.fps} fps)')
 
     if args.sheet:
         import imageio
 
-        sheet_path = Path(args.sheet)
-        imageio.imwrite(str(sheet_path), frames_to_sheet(frames, args.rows, args.columns))
+        for field, frames in frames_by_field.items():
+            sheet_path = field_path(Path(args.sheet), field, multiple)
+            imageio.imwrite(str(sheet_path), frames_to_sheet(frames, args.rows, args.columns))
 
-        print(f'wrote {sheet_path} ({args.rows}x{args.columns} contact sheet)')
+            print(f'wrote {sheet_path} ({args.rows}x{args.columns} contact sheet)')
 
     if args.serve is not None:
         from memmap_replay_buffer.frontend import serve
 
         stats = dict(
             folder = str(Path(args.folder).resolve()),
-            field = field,
-            shape = ' x '.join(str(dim) for dim in frames.shape[1:]),
-            dtype = str(frames.dtype),
-            episode = args.episode,
-            episodes = buffer.num_episodes,
-            frames = len(frames),
+            episodes = episodes,
+            frames = len(next(iter(frames_by_field.values()))),
             fps = args.fps,
-            scale = args.scale
+            scale = args.scale,
+            fields = [
+                dict(
+                    name = field,
+                    shape = ' x '.join(str(dim) for dim in frames.shape[1:]),
+                    dtype = str(frames.dtype)
+                )
+                for field, frames in frames_by_field.items()
+            ]
         )
 
-        serve(path, stats, port = args.serve, open_browser = not args.no_browser)
+        serve(videos, stats, port = args.serve, open_browser = not args.no_browser)
 
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors = True)

@@ -175,5 +175,80 @@ def test_save_video_errors(buffer, tmp_path):
         fields = dict(image = ('uint8', (8, 8, 3)), latent = ('float', (4, 4)))
     )
 
+    assert ambiguous.image_fields() == ['image', 'latent']
+
     with pytest.raises(ValueError, match = 'multiple'):
         ambiguous.save_video(tmp_path / 'ambiguous.mp4')
+
+def test_episode_frames_multiple_episodes(buffer, tmp_path):
+    first = np.zeros((5, 8, 8, 3), dtype = np.uint8)
+    second = np.ones((3, 8, 8, 3), dtype = np.uint8)
+
+    buffer.store_episode(image = first, action = np.zeros(5, dtype = np.int32))
+    buffer.store_episode(image = second, action = np.zeros(3, dtype = np.int32))
+
+    frames = buffer.episode_frames([0, 1], field = 'image')
+
+    assert frames.shape == (8, 8, 8, 3)
+    assert np.array_equal(frames[:5], first)
+    assert np.array_equal(frames[5:], second)
+
+    assert buffer.episode_frames((1, 1), field = 'image').shape == (6, 8, 8, 3)
+    assert buffer.episode_frames(0, field = 'image').shape == (5, 8, 8, 3)
+
+    with pytest.raises(ValueError, match = 'out of range'):
+        buffer.episode_frames([0, 5], field = 'image')
+
+    with pytest.raises(ValueError, match = 'at least one'):
+        buffer.episode_frames([], field = 'image')
+
+def test_cli_multiple_episodes_and_fields(tmp_path):
+    folder = tmp_path / 'multi-buffer'
+
+    buffer = ReplayBuffer(
+        folder,
+        max_episodes = 4,
+        max_timesteps = 6,
+        fields = dict(
+            image = ('uint8', (8, 8, 3)),
+            wrist = ('uint8', (8, 4, 3)),
+            action = 'int'
+        ),
+        circular = True
+    )
+
+    for length in (5, 3):
+        buffer.store_episode(
+            image = np.random.randint(0, 256, (length, 8, 8, 3), dtype = np.uint8),
+            wrist = np.random.randint(0, 256, (length, 8, 4, 3), dtype = np.uint8),
+            action = np.zeros(length, dtype = np.int32)
+        )
+
+    video_main([
+        str(folder), '--episode', '0,1', '--field', 'image,wrist',
+        '--output', str(tmp_path / 'multi.mp4'), '--fps', '5',
+        '--sheet', str(tmp_path / 'multi.png')
+    ])
+
+    assert read_video(tmp_path / 'multi.image.mp4').shape == (8, 8, 8, 3)
+    assert read_video(tmp_path / 'multi.wrist.mp4').shape == (8, 8, 4, 3)
+
+    assert imageio.v2.imread(str(tmp_path / 'multi.image.png')).ndim == 3
+    assert imageio.v2.imread(str(tmp_path / 'multi.wrist.png')).ndim == 3
+
+    # without --field, all image-like fields are rendered
+
+    video_main([str(folder), '--episode', '1', '--output', str(tmp_path / 'auto.mp4'), '--fps', '5'])
+
+    assert read_video(tmp_path / 'auto.image.mp4').shape == (3, 8, 8, 3)
+    assert read_video(tmp_path / 'auto.wrist.mp4').shape == (3, 8, 4, 3)
+
+    for bad_args in (
+        ['--episode', '0,x'],
+        ['--episode', ''],
+        ['--episode', '99'],
+        ['--field', 'image,nonexistent'],
+        ['--field', '']
+    ):
+        with pytest.raises(SystemExit):
+            video_main([str(folder)] + bad_args)

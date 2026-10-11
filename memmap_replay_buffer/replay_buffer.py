@@ -11,7 +11,7 @@ import einx
 import numpy as np
 import torch
 from beartype import beartype
-from beartype.typing import Any, Literal
+from beartype.typing import Any, Literal, Sequence
 from einops import rearrange
 from numpy import ndarray
 from numpy.lib.format import open_memmap
@@ -1235,8 +1235,12 @@ class ReplayBufferBase:
 
     # video
 
+    def image_fields(self):
+        """ all fields that look like images, in field declaration order """
+        return [name for name in self.shapes if len(self.shapes[name]) >= 2]
+
     def default_image_field(self):
-        candidates = sorted(name for name in self.fieldnames if len(self.shapes[name]) >= 2)
+        candidates = self.image_fields()
 
         if len(candidates) == 1:
             return candidates[0]
@@ -1246,17 +1250,28 @@ class ReplayBufferBase:
 
         raise ValueError(f'multiple image-like fields {candidates} - pass `field` explicitly')
 
-    def episode_frames(self, episode_index: int = 0, field: str | None = None):
-        field = default(field, self.default_image_field())
+    def episode_frames(self, episode_index: int | Sequence[int] = 0, field: str | None = None):
+        if not exists(field):
+            field = self.default_image_field()
 
         if field not in self.fieldnames:
             raise ValueError(f'invalid field name `{field}` - must be one of {self.fieldnames}')
 
-        if not (0 <= episode_index < self.num_episodes):
-            raise ValueError(f'episode_index {episode_index} out of range - buffer has {self.num_episodes} episodes')
+        episode_indices = [episode_index] if isinstance(episode_index, (int, np.integer)) else list(episode_index)
 
-        episode_len = int(self.episode_lens[episode_index])
-        return self.data[field][episode_index, :episode_len].copy()
+        if len(episode_indices) == 0:
+            raise ValueError('at least one episode index is required')
+
+        for index in episode_indices:
+            if not (0 <= index < self.num_episodes):
+                raise ValueError(f'episode_index {index} out of range - buffer has {self.num_episodes} episodes')
+
+        frames = [self.data[field][index, :int(self.episode_lens[index])] for index in episode_indices]
+
+        if len(frames) == 1:
+            return frames[0].copy()
+
+        return np.concatenate(frames, axis = 0)
 
     def save_video(self, path: str | Path, episode_index: int = 0, field: str | None = None, fps: int = 30, **kwargs):
         from memmap_replay_buffer.video import trajectory_to_video

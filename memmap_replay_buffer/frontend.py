@@ -1,17 +1,40 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # helpers
 
+def normalize_stats(stats: dict):
+    """ fold the legacy single-field stats keys into a `fields` list """
+    stats = dict(stats)
+
+    if 'fields' not in stats and 'field' in stats:
+        stats['fields'] = [dict(
+            name = stats.pop('field'),
+            shape = stats.pop('shape', ''),
+            dtype = stats.pop('dtype', '')
+        )]
+
+    return stats
+
+def normalize_videos(videos):
+    if isinstance(videos, dict):
+        return {str(name): Path(path) for name, path in videos.items()}
+
+    return dict(video = Path(videos))
+
+def content_type(path: Path):
+    return mimetypes.guess_type(path.name)[0] or 'video/mp4'
+
 def render_page(stats: dict):
     template_path = Path(__file__).parent / 'frontend' / 'index.html'
-    return template_path.read_text().replace('__REPLAY_STATS__', json.dumps(stats))
+    return template_path.read_text().replace('__REPLAY_STATS__', json.dumps(normalize_stats(stats)))
 
 def parse_range(range_header: str | None, size: int):
     if not range_header or not range_header.startswith('bytes='):
@@ -28,7 +51,7 @@ def parse_range(range_header: str | None, size: int):
 # server
 
 class ReplayBufferHandler(BaseHTTPRequestHandler):
-    video_path: Path
+    video_paths: dict[str, Path]
     page: str
 
     protocol_version = 'HTTP/1.1'
@@ -40,11 +63,25 @@ class ReplayBufferHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == '/':
-            self.send_page()
-        elif path == '/video':
-            self.send_video()
-        else:
-            self.send_error(404)
+            return self.send_page()
+
+        video_path = self.video_for_path(path)
+
+        if video_path is not None:
+            return self.send_video(video_path)
+
+        self.send_error(404)
+
+    def video_for_path(self, path):
+        # `/video` serves the first video for backward compatibility
+
+        if path == '/video':
+            return next(iter(self.video_paths.values()), None)
+
+        if path.startswith('/video/'):
+            return self.video_paths.get(unquote(path[len('/video/'):]))
+
+        return None
 
     def send_page(self):
         body = self.page.encode()
@@ -55,15 +92,15 @@ class ReplayBufferHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_video(self):
-        size = self.video_path.stat().st_size
+    def send_video(self, video_path):
+        size = video_path.stat().st_size
         byte_range = parse_range(self.headers.get('Range'), size)
 
         start, end = byte_range if byte_range else (0, size - 1)
         is_partial = byte_range is not None
 
         self.send_response(206 if is_partial else 200)
-        self.send_header('Content-Type', 'video/mp4')
+        self.send_header('Content-Type', content_type(video_path))
         self.send_header('Content-Length', str(end - start + 1))
         self.send_header('Accept-Ranges', 'bytes')
 
@@ -74,7 +111,7 @@ class ReplayBufferHandler(BaseHTTPRequestHandler):
 
         # stream the selected slice, seeking works via repeated range requests
 
-        with open(self.video_path, 'rb') as f:
+        with open(video_path, 'rb') as f:
             f.seek(start)
             remaining = end - start + 1
 
@@ -87,16 +124,16 @@ class ReplayBufferHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
-def make_server(video_path: str | Path, stats: dict, host = '127.0.0.1', port = 8000):
+def make_server(videos: str | Path | dict[str, Path], stats: dict, host = '127.0.0.1', port = 8000):
     handler = type('Handler', (ReplayBufferHandler,), dict(
-        video_path = Path(video_path),
+        video_paths = normalize_videos(videos),
         page = render_page(stats)
     ))
 
     return ThreadingHTTPServer((host, port), handler)
 
-def serve(video_path: str | Path, stats: dict, host = '127.0.0.1', port = 8000, open_browser = True, block = True):
-    httpd = make_server(video_path, stats, host, port)
+def serve(videos: str | Path | dict[str, Path], stats: dict, host = '127.0.0.1', port = 8000, open_browser = True, block = True):
+    httpd = make_server(videos, stats, host, port)
     url = f'http://{host}:{httpd.server_address[1]}/'
 
     print(f'serving replay at {url} (ctrl-c to stop)')

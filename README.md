@@ -161,20 +161,21 @@ buffer.update(0, returns = returns_for_one)             # scalar index
 all_data = buffer.get_all_data()  # dict of tensors, time-padded to the longest episode
 ```
 
-### Rendering an episode to video
+### Rendering episodes to video
 
-When a field holds one frame per timestep, `save_video` renders an episode to `.mp4` or `.gif` (needs `pip install memmap-replay-buffer[video]`). The image field is auto-detected, and frames may be `uint8` or float in `[0., 1.]`.
+When a field holds one frame per timestep, `save_video` renders an episode to `.mp4` or `.gif` (needs `pip install memmap-replay-buffer[video]`). The image field is auto-detected, and frames may be `uint8` or float in `[0., 1.]`. Pass a list of episodes to concatenate them in time.
 
 ```python
 buffer.save_video('./episode-0.mp4', episode_index = 0, fps = 30)
+buffer.save_video('./episodes-0-3-5.mp4', episode_index = [0, 3, 5], fps = 30)
 ```
 
 `trajectory_to_video(frames, path, fps)` is exported for plain `(time, height, width, channels)` arrays.
 
-The same is available from the command line, with `--sheet` for a contact sheet and `--serve` for a minimal local frontend (video centered, field stats and a live frame counter to the side).
+The same is available from the command line, with `--sheet` for a contact sheet and `--serve` for a minimal local frontend. `--episode` and `--field` accept comma-delimited lists - with multiple cameras (image-like fields), one video is written per field (`<name>.<field>.<ext>`) and the frontend plays them side by side, synchronized, with a live frame counter to the side. The frontend has frame-level controls: a timeline scrubber, single-frame stepping (buttons, left/right arrows, shift for 10, or mouse wheel over the videos), play/pause, and slowdown playback (down to 0.1x).
 
 ```bash
-$ inspect-replay-buffer ./image_data --episode 0 --output episode-0.mp4 --serve 8000
+$ inspect-replay-buffer ./image_data --episode 0,3,5 --field front,wrist --output replay.mp4 --serve 8000
 ```
 
 ### Reopening, read-only, and clearing

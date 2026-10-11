@@ -16,11 +16,49 @@
     color: #e8e8e8;
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
-  video {
-    max-width: min(75vw, 1200px);
-    max-height: 88vh;
+  #stage {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: min(calc(100vw - 340px), 1200px);
+  }
+  main {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 12px;
+  }
+  figure { margin: 0; min-width: 0; }
+  figure video { width: 100%; max-height: 74vh; display: block; border-radius: 6px; background: #000; }
+  figcaption { margin-top: 6px; color: #8a8f98; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  #controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #17181b;
+    border: 1px solid #26282c;
     border-radius: 6px;
-    background: #000;
+  }
+  #controls button {
+    width: 40px;
+    padding: 4px 0;
+    background: #1f2126;
+    color: #e8e8e8;
+    border: 1px solid #2e3136;
+    border-radius: 4px;
+    font: inherit;
+    cursor: pointer;
+  }
+  #controls button:hover { background: #26282c; }
+  #timeline { flex: 1; accent-color: #7fb4e6; min-width: 0; }
+  #controls .time { color: #8a8f98; white-space: nowrap; }
+  #speed {
+    background: #1f2126;
+    color: #e8e8e8;
+    border: 1px solid #2e3136;
+    border-radius: 4px;
+    padding: 4px;
+    font: inherit;
   }
   aside {
     position: fixed;
@@ -43,16 +81,35 @@
   #extras:empty { display: none; }
   @media (max-width: 1000px) {
     body { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 16px; }
-    video { max-width: 100%; }
+    #stage { width: 100%; max-width: 640px; }
     aside { position: static; transform: none; width: 100%; max-width: 480px; }
   }
 </style>
 </head>
 <body>
-  <video id="replay" src="/video" controls autoplay loop muted></video>
+  <div id="stage">
+    <main id="replays"></main>
+    <footer id="controls">
+      <button id="step-back" title="previous frame (left arrow)">&#10216;</button>
+      <button id="play-pause" title="play / pause (space)">&#9654;</button>
+      <button id="step-forward" title="next frame (right arrow)">&#10217;</button>
+      <input id="timeline" type="range" min="0" value="0" step="1" />
+      <span id="time" class="time">0 / 0</span>
+      <select id="speed">
+        <option value="0.1">0.1x</option>
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
+    </footer>
+  </div>
   <aside>
     <h1>replay buffer</h1>
     <dl id="stats"></dl>
+    <h2>fields</h2>
+    <dl id="field-stats"></dl>
     <h2>time</h2>
     <dl>
       <dt>frame</dt><dd id="frame">0</dd>
@@ -61,27 +118,168 @@
   </aside>
 <script>
   const stats = __REPLAY_STATS__;
-  const video = document.getElementById('replay');
+  const fields = stats.fields ?? [{ name: 'video' }];
   const extras = document.getElementById('extras');
 
   const statsList = document.getElementById('stats');
   for (const [key, value] of Object.entries(stats)) {
+    if (key === 'fields') continue;
+
     const dt = document.createElement('dt');
     dt.textContent = key;
     const dd = document.createElement('dd');
-    dd.textContent = value;
+    dd.textContent = Array.isArray(value) ? value.join(', ') : value;
     statsList.append(dt, dd);
   }
 
-  const frameLabel = document.getElementById('frame');
-  const updateTime = () => {
-    frameLabel.textContent = `${Math.round(video.currentTime * stats.fps)} / ${stats.frames}`;
+  const fieldList = document.getElementById('field-stats');
+  for (const field of fields) {
+    const dt = document.createElement('dt');
+    dt.textContent = field.name;
+    const dd = document.createElement('dd');
+    dd.textContent = [field.shape, field.dtype].filter(Boolean).join(' ') || 'video';
+    fieldList.append(dt, dd);
+  }
+
+  // one video per field, every video follows the first
+
+  const replays = document.getElementById('replays');
+  const single = fields.length === 1;
+
+  const videos = fields.map((field, index) => {
+    const figure = document.createElement('figure');
+    const video = document.createElement('video');
+
+    video.src = single ? '/video' : `/video/${encodeURIComponent(field.name)}`;
+    video.controls = false;
+    video.autoplay = true;
+    video.loop = true;
+    video.muted = true;
+    video.playsInline = true;
+
+    const caption = document.createElement('figcaption');
+    caption.textContent = field.name;
+
+    figure.append(video, caption);
+    replays.append(figure);
+    return video;
+  });
+
+  const [master, ...slaves] = videos;
+
+  const sync = () => {
+    for (const slave of slaves) {
+      if (Math.abs(slave.currentTime - master.currentTime) > 0.08) {
+        slave.currentTime = master.currentTime;
+      }
+    }
   };
-  video.addEventListener('timeupdate', updateTime);
+
+  slaves.forEach(slave => slave.addEventListener('loadedmetadata', sync));
+
+  master.addEventListener('play', () => {
+    playPause.textContent = '⏸';
+    slaves.forEach(video => video.play());
+  });
+
+  master.addEventListener('pause', () => {
+    playPause.textContent = '▶';
+    slaves.forEach(video => video.pause());
+  });
+
+  master.addEventListener('ratechange', () => {
+    slaves.forEach(video => video.playbackRate = master.playbackRate);
+    speed.value = String(master.playbackRate);
+  });
+
+  master.addEventListener('seeking', sync);
+  master.addEventListener('seeked', sync);
+  master.addEventListener('timeupdate', sync);
+
+  const tick = () => {
+    if (!master.paused) sync();
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+
+  // frame-level controls
+
+  const playPause = document.getElementById('play-pause');
+  const timeline = document.getElementById('timeline');
+  const timeLabel = document.getElementById('time');
+  const speed = document.getElementById('speed');
+  const frameLabel = document.getElementById('frame');
+
+  const totalFrames = () => stats.frames ?? (Number.isFinite(master.duration) ? Math.round(master.duration * stats.fps) : 0);
+  const frameFromTime = (time) => Math.max(0, Math.min(Math.round(time * stats.fps), totalFrames() - 1));
+
+  const updateTime = () => {
+    const frame = frameFromTime(master.currentTime);
+    const total = totalFrames();
+
+    frameLabel.textContent = `${frame} / ${total}`;
+    timeLabel.textContent = `${frame} / ${total}`;
+    timeline.max = String(Math.max(total - 1, 0));
+
+    if (!scrubbing) timeline.value = String(frame);
+  };
+
+  let scrubbing = false;
+  timeline.addEventListener('pointerdown', () => scrubbing = true);
+  window.addEventListener('pointerup', () => { if (scrubbing) { scrubbing = false; updateTime(); } });
+
+  const seekToFrame = (frame) => {
+    master.currentTime = Math.max(0, Math.min(frame, totalFrames() - 1)) / stats.fps;
+    sync();
+    updateTime();
+  };
+
+  timeline.addEventListener('input', () => {
+    master.pause();
+    seekToFrame(Number(timeline.value));
+  });
+
+  playPause.addEventListener('click', () => master.paused ? master.play() : master.pause());
+  document.getElementById('step-back').addEventListener('click', () => { master.pause(); seekToFrame(frameFromTime(master.currentTime) - 1); });
+  document.getElementById('step-forward').addEventListener('click', () => { master.pause(); seekToFrame(frameFromTime(master.currentTime) + 1); });
+
+  speed.addEventListener('change', () => master.playbackRate = Number(speed.value));
+
+  // mouse wheel over the videos steps through frames
+
+  replays.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    master.pause();
+    seekToFrame(frameFromTime(master.currentTime) + Math.sign(event.deltaY));
+  }, { passive: false });
+
+  window.addEventListener('keydown', (event) => {
+    if (event.target.matches('input, select, button, textarea')) return;
+
+    const step = event.shiftKey ? 10 : 1;
+
+    if (event.key === ' ') {
+      event.preventDefault();
+      master.paused ? master.play() : master.pause();
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      master.pause();
+      seekToFrame(frameFromTime(master.currentTime) - step);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      master.pause();
+      seekToFrame(frameFromTime(master.currentTime) + step);
+    }
+  });
+
+  master.addEventListener('timeupdate', updateTime);
+  master.addEventListener('loadedmetadata', updateTime);
+  master.addEventListener('play', updateTime);
+  master.addEventListener('pause', updateTime);
   updateTime();
 
-  // future: sync value predictions / actions / other per-timestep elements to `video.currentTime`
-  window.replay = { stats, video, extras };
+  // future: sync value predictions / actions / other per-timestep elements to `master.currentTime`
+  window.replay = { stats, fields, videos, master, timeline, seekToFrame, extras };
 </script>
 </body>
 </html>
