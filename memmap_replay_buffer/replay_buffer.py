@@ -987,9 +987,17 @@ class ReplayBufferBase:
 
     @can_write
     @beartype
-    def update(self, indices: int | list | ndarray | slice | None = None, **data):
+    def update(
+        self,
+        indices: int | list | ndarray | slice | None = None,
+        timestep_start: int = 0,
+        **data
+    ):
         if len(data) == 0:
             raise ValueError('No data provided to `update`')
+
+        if timestep_start < 0:
+            raise ValueError(f'timestep_start must be non-negative, got {timestep_start}')
 
         indices, scalar_index = expand_indices(indices, self.max_episodes)
 
@@ -1028,11 +1036,11 @@ class ReplayBufferBase:
 
                 time_dim = value.shape[1]
 
-                if time_dim > self.max_timesteps:
+                if timestep_start + time_dim > self.max_timesteps:
                     raise ValueError(f'You exceeded the `max_timesteps` ({self.max_timesteps}) set on the replay buffer. Please increase it on init.')
 
                 value = np.broadcast_to(value, (len(indices), time_dim, *self.shapes[name]))
-                self.data[name][indices, :time_dim] = value[order]
+                self.data[name][indices, timestep_start:timestep_start + time_dim] = value[order]
 
             else:
                 value = cast_to_target_shape(value, self.meta_shapes[name], num_leading_dims = 1)

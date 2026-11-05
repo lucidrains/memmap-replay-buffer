@@ -155,6 +155,46 @@ buffer.update(episode_ids, returns = returns_for_ids)   # specific episodes
 buffer.update(0, returns = returns_for_one)             # scalar index
 ```
 
+### Computed fields and selective timestep training
+
+Derived fields must be declared in `fields` when the buffer is created, then written after collection. Use `timestep_start` to write contiguous time chunks without loading a whole episode into memory. A common self-play recipe is to compute per-timestep advantages, threshold them into a boolean field, and then let the timestep-level dataset fetch only the selected timesteps.
+
+```python
+buffer = ReplayBuffer(
+    './replay_data',
+    max_episodes = 1000,
+    max_timesteps = 500,
+    fields = dict(
+        state = ('float', (8,)),
+        reward = 'float',
+        advantage = 'float',
+        high_advantage = ('bool', (), False),   # declares the derived mask
+    )
+)
+
+# compute advantages in episode batches
+buffer.update(episode_ids, advantage = advantages)
+
+# or write contiguous time chunks for all episodes
+for start in range(0, max_len, 128):
+    buffer.update(
+        timestep_start = start,
+        advantage = advantage_chunk
+    )
+
+# set the mask from a comparison of the computed field
+buffer.update(high_advantage = advantage > threshold)
+
+# only selected timesteps are returned
+dataloader = buffer.dataloader(
+    batch_size = 64,
+    timestep_level = True,
+    filter_fields = dict(high_advantage = True)
+)
+```
+
+`demo_advantage_filtering.py` contains a complete self-play loop that computes advantages in batches, marks extreme positive advantages, and trains only on those timesteps.
+
 ### Pulling everything at once
 
 ```python
