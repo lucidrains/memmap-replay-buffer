@@ -3,15 +3,16 @@ from __future__ import annotations
 import pickle
 import warnings
 from collections import namedtuple
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from functools import partial, wraps
 from pathlib import Path
+from typing import Any, Literal
 
 import einx
 import numpy as np
 import torch
 from beartype import beartype
-from beartype.typing import Any, Literal, Sequence
 from einops import rearrange
 from numpy import ndarray
 from numpy.lib.format import open_memmap
@@ -25,7 +26,11 @@ from torch.utils.data import DataLoader, Dataset, default_collate
 
 PrimitiveType = int | float | bool
 
-PrimitiveTypeStr = Literal['int', 'float', 'bool', 'uint8']
+PrimitiveTypeStr = Literal['int', 'int64', 'long', 'float', 'bool', 'uint8']
+
+WindowFilterMode = Literal['start', 'all', 'any']
+
+AgeMode = Literal['stream', 'global']
 
 FieldInfo = (
     PrimitiveTypeStr |
@@ -33,7 +38,16 @@ FieldInfo = (
     tuple[PrimitiveTypeStr, int | tuple[int, ...], PrimitiveType]
 )
 
-DTYPES = dict(int = np.int32, float = np.float32, bool = np.bool_, uint8 = np.uint8)
+DTYPES = dict(
+    int = np.int32,
+    int64 = np.int64,
+    long = np.int64,
+    float = np.float32,
+    bool = np.bool_,
+    uint8 = np.uint8,
+)
+
+FieldStats = namedtuple('FieldStats', ('count', 'mean', 'std', 'rms', 'min', 'max'))
 
 # helpers
 
@@ -153,6 +167,276 @@ def load_or_write_config(folder: Path, config: dict, overwrite: bool):
     with open(str(config_path), 'wb') as f:
         pickle.dump(config, f)
 
+# sampling / filtering / stats helpers
+
+def eval_field_predicate(field_data: Tensor, filter_value: Any) -> Tensor:
+    if callable(filter_value):
+        mask = filter_value(field_data)
+        if not is_tensor(mask):
+            mask = from_numpy(np.asarray(mask))
+        return mask.bool()
+
+    if isinstance(filter_value, bool):
+        field_data = field_data.bool()
+
+    return field_data == filter_value
+
+def age_filter_mask(ages: Tensor, min_age: int | None = None, max_age: int | None = None) -> Tensor:
+    mask = torch.ones_like(ages, dtype = torch.bool)
+    if exists(min_age):
+        mask &= ages >= min_age
+    if exists(max_age):
+        mask &= ages < max_age
+    return mask
+
+def rolling_window_mask(
+    mask: Tensor,
+    horizon: int,
+    mode: Literal['all', 'any'],
+    circular: bool = False,
+    target_lens: Tensor | None = None
+) -> Tensor:
+    assert mode in ('all', 'any'), f'invalid window_filter_mode `{mode}`'
+    mask = mask.bool()
+
+    if mask.shape[1] == 0 or horizon <= 1:
+        return mask
+
+    if circular:
+        ext = torch.cat((mask, mask[:, :horizon - 1]), dim = 1).to(torch.int32)
+    else:
+        ext = pad_tensor(mask.to(torch.int32), (0, horizon - 1))
+
+    cs = pad_tensor(ext.cumsum(dim = 1), (1, 0))
+    win_sum = cs[:, horizon:] - cs[:, :-horizon]
+
+    if mode == 'any':
+        return win_sum > 0
+
+    if exists(target_lens):
+        return win_sum == target_lens
+
+    return win_sum == horizon
+
+def resolve_mixture_counts(batch_size: int, weights: Sequence[float]) -> list[int]:
+    if len(weights) == 0:
+        raise ValueError('mixture must contain at least one stratum')
+
+    weights = [float(w) for w in weights]
+
+    if any(w < 0. for w in weights):
+        raise ValueError(f'mixture weights must be non-negative, got {weights}')
+
+    total = sum(weights)
+
+    if total <= 0.:
+        raise ValueError(f'mixture weights must sum to a positive number, got {weights}')
+
+    probs = [w / total for w in weights]
+    counts = [int(batch_size * p) for p in probs]
+    remainder = batch_size - sum(counts)
+
+    last_active = max(i for i, p in enumerate(probs) if p > 0.)
+    counts[last_active] += remainder
+    return counts
+
+def select_indices_from_mask(mask: Tensor, count: int, replacement: bool = True) -> tuple[Tensor, Tensor]:
+    rows, cols = mask.nonzero(as_tuple = True)
+    num_valid = rows.numel()
+
+    if count == 0:
+        return rows[:0], cols[:0]
+
+    if num_valid == 0:
+        return rows, cols
+
+    if replacement:
+        pick = torch.randint(0, num_valid, (count,))
+    else:
+        if count > num_valid:
+            raise ValueError(f'cannot sample {count} items without replacement from {num_valid} valid candidates')
+        pick = torch.randperm(num_valid)[:count]
+
+    return rows[pick], cols[pick]
+
+def validate_sample_args(
+    batch_size: int,
+    horizon: int | None,
+    timestep_level: bool | None,
+    last_fields: tuple[str, ...] | None,
+    return_mask: bool
+):
+    if batch_size <= 0:
+        raise ValueError(f'batch_size must be positive, got {batch_size}')
+
+    if exists(horizon) and timestep_level is True:
+        raise ValueError('cannot specify both horizon and timestep_level')
+
+    if exists(horizon) and horizon < 1:
+        raise ValueError(f'horizon must be >= 1, got {horizon}')
+
+    if exists(last_fields) and not exists(horizon):
+        raise ValueError('last_fields is only supported when horizon is specified')
+
+    if return_mask and not exists(horizon):
+        raise ValueError('return_mask is only supported when horizon is specified')
+
+def resolve_sample_fields(
+    all_fieldnames: set[str],
+    horizon: int | None,
+    fields: tuple[str, ...] | None,
+    last_fields: tuple[str, ...] | None,
+    fieldname_map: dict[str, str],
+    to_named_tuple: bool | tuple[str, ...] | None,
+    return_mask: bool,
+    return_indices: bool,
+    user_meta_names: tuple[str, ...] = (),
+    include_metadata: bool = False
+):
+    if isinstance(to_named_tuple, tuple) and not exists(fields):
+        inv_map = {v: k for k, v in fieldname_map.items()}
+        needed_fields = []
+        needed_last = list(default(last_fields, ()))
+        needed_meta = []
+
+        for req in to_named_tuple:
+            orig = inv_map.get(req, req)
+
+            if orig in all_fieldnames and orig not in needed_fields:
+                needed_fields.append(orig)
+            elif exists(horizon) and orig.startswith('last_') and orig[5:] in all_fieldnames:
+                base = orig[5:]
+                if base not in needed_last:
+                    needed_last.append(base)
+            elif orig in user_meta_names and orig not in needed_meta:
+                needed_meta.append(orig)
+            elif orig == '_mask' and exists(horizon):
+                return_mask = True
+            elif orig == '_indices':
+                return_indices = True
+
+        sample_fields = tuple(needed_fields)
+        sample_last_fields = tuple(needed_last)
+        sample_meta_fields = tuple(needed_meta) if include_metadata else ()
+    else:
+        sample_fields = default(fields, tuple(all_fieldnames))
+        sample_last_fields = default(last_fields, ())
+        sample_meta_fields = user_meta_names if include_metadata else ()
+
+    for name in sample_fields:
+        if name not in all_fieldnames:
+            raise ValueError(f'invalid field `{name}` - must be one of {all_fieldnames}')
+
+    for name in sample_last_fields:
+        if name not in all_fieldnames:
+            raise ValueError(f'invalid last_field `{name}` - must be one of {all_fieldnames}')
+
+    return sample_fields, sample_last_fields, sample_meta_fields, return_mask, return_indices
+
+def format_batch(
+    batch: dict[str, Tensor],
+    to_named_tuple: bool | tuple[str, ...] | None = None,
+    device: torch.device | str | None = None
+):
+    if to_named_tuple is True or isinstance(to_named_tuple, tuple):
+        keys = tuple(batch.keys()) if to_named_tuple is True else to_named_tuple
+
+        for field in keys:
+            if field not in batch:
+                raise ValueError(f'field `{field}` not found in batch. available fields: {list(batch.keys())}')
+
+        sanitized = tuple(f.lstrip('_') if f.startswith('_') else f for f in keys)
+        NamedTupleCls = namedtuple('Batch', sanitized)
+        batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(keys, sanitized, strict = True)})
+
+    return tree_map_to_device(batch, device)
+
+class _LazyFieldView(Mapping):
+    def __init__(self, getters: dict[str, Callable[[], Tensor]]):
+        self._getters = getters
+        self._cache: dict[str, Tensor] = dict()
+
+    def __getitem__(self, key: str) -> Tensor:
+        if key not in self._cache:
+            if key not in self._getters:
+                raise KeyError(f'unknown field `{key}` - available: {sorted(self._getters)}')
+            self._cache[key] = self._getters[key]()
+        return self._cache[key]
+
+    def __iter__(self):
+        return iter(self._getters)
+
+    def __len__(self):
+        return len(self._getters)
+
+class _StatsAccumulator:
+    """ numerically stable chunked statistics via Chan's parallel variance update """
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = tuple(shape)
+        self.count = 0
+        self.mean = np.zeros(self.shape, dtype = np.float64)
+        self.m2 = np.zeros(self.shape, dtype = np.float64)
+        self.sum_sq = np.zeros(self.shape, dtype = np.float64)
+        self.min = np.full(self.shape, np.inf, dtype = np.float64)
+        self.max = np.full(self.shape, -np.inf, dtype = np.float64)
+
+    def update(self, values: ndarray):
+        n = values.shape[0]
+        if n == 0:
+            return
+
+        values_f64 = np.asarray(values, dtype = np.float64)
+        batch_mean = values_f64.mean(axis = 0)
+        batch_m2 = np.square(values_f64 - batch_mean).sum(axis = 0)
+
+        if self.count == 0:
+            self.mean = batch_mean
+            self.m2 = batch_m2
+        else:
+            delta = batch_mean - self.mean
+            new_count = self.count + n
+            self.mean = self.mean + delta * (n / new_count)
+            self.m2 = self.m2 + batch_m2 + np.square(delta) * (self.count * n / new_count)
+
+        self.count += n
+        self.sum_sq += np.square(values_f64).sum(axis = 0)
+        self.min = np.minimum(self.min, values_f64.min(axis = 0))
+        self.max = np.maximum(self.max, values_f64.max(axis = 0))
+
+    def finalize(self) -> FieldStats:
+        is_scalar = self.shape == ()
+
+        if self.count == 0:
+            if is_scalar:
+                nan = float('nan')
+                return FieldStats(0, nan, nan, nan, nan, nan)
+
+            nan_t = torch.full(self.shape, float('nan'), dtype = torch.float32)
+            return FieldStats(0, nan_t.clone(), nan_t.clone(), nan_t.clone(), nan_t.clone(), nan_t.clone())
+
+        std = np.sqrt(np.maximum(self.m2 / self.count, 0.))
+        rms = np.sqrt(np.maximum(self.sum_sq / self.count, 0.))
+
+        if is_scalar:
+            return FieldStats(
+                count = int(self.count),
+                mean = float(self.mean),
+                std = float(std),
+                rms = float(rms),
+                min = float(self.min),
+                max = float(self.max),
+            )
+
+        return FieldStats(
+            count = int(self.count),
+            mean = torch_from_numpy(self.mean.astype(np.float32)),
+            std = torch_from_numpy(std.astype(np.float32)),
+            rms = torch_from_numpy(rms.astype(np.float32)),
+            min = torch_from_numpy(self.min.astype(np.float32)),
+            max = torch_from_numpy(self.max.astype(np.float32)),
+        )
+
 # data
 
 def collate_var_time(data, fields_to_pad = None):
@@ -176,12 +460,16 @@ def episode_filter_mask(replay_buffer: ReplayBufferBase, filter_meta: dict | Non
     valid_mask = episode_lens >= min_episode_len
 
     for field_name, filter_value in default(filter_meta, {}).items():
+        if field_name not in replay_buffer.meta_data:
+            raise ValueError(f'invalid meta field name `{field_name}` - must be one of {replay_buffer.meta_fieldnames}')
+
         field_data = from_numpy(replay_buffer.meta_data[field_name])
+        field_mask = eval_field_predicate(field_data, filter_value)
 
-        if isinstance(filter_value, bool):
-            field_data = field_data.bool()
+        if field_mask.shape != valid_mask.shape:
+            raise ValueError(f'filter_meta predicate for `{field_name}` must return shape {tuple(valid_mask.shape)}, got {tuple(field_mask.shape)}')
 
-        valid_mask &= field_data == filter_value
+        valid_mask &= field_mask
 
     return valid_mask
 
@@ -203,21 +491,83 @@ def episode_timestep_grid(episode_indices, episode_lens, horizon = 1):
     return grid, valid_mask
 
 def filter_fields_mask(data: dict, episode_indices, max_timesteps, filter_fields: dict):
+    expected_shape = (episode_indices.numel(), max_timesteps)
+
+    if expected_shape[0] == 0 or expected_shape[1] == 0:
+        return torch.zeros(expected_shape, dtype = torch.bool)
+
     mask = None
+    ep_np = episode_indices.numpy()
 
     for field_name, filter_value in filter_fields.items():
-        field_data = from_numpy(data[field_name][episode_indices.numpy(), :max_timesteps])
+        if field_name not in data:
+            raise ValueError(f'invalid field name `{field_name}` - must be one of {set(data.keys())}')
 
-        if isinstance(filter_value, bool):
-            field_data = field_data.bool()
+        field_data = from_numpy(data[field_name][ep_np, :max_timesteps])
 
-        if field_data.ndim != 2:
+        if not callable(filter_value) and field_data.ndim != 2:
             raise ValueError(f'filter_fields only supports scalar fields, got shape {tuple(field_data.shape[2:])} for `{field_name}`')
 
-        field_mask = field_data == filter_value
+        field_mask = eval_field_predicate(field_data, filter_value)
+
+        if field_mask.shape != expected_shape:
+            raise ValueError(f'filter_fields predicate for `{field_name}` must return shape {expected_shape}, got {tuple(field_mask.shape)}')
+
         mask = field_mask if not exists(mask) else (mask & field_mask)
 
     return mask
+
+def eval_where_mask_episode(
+    replay_buffer: ReplayBufferBase,
+    episode_indices: Tensor,
+    max_timesteps: int,
+    where: Callable | Tensor
+) -> Tensor:
+    expected_shape = (episode_indices.numel(), max_timesteps)
+
+    if expected_shape[0] == 0 or expected_shape[1] == 0:
+        return torch.zeros(expected_shape, dtype = torch.bool)
+
+    if is_tensor(where):
+        if tuple(where.shape) != expected_shape:
+            raise ValueError(f'where mask must have shape {expected_shape}, got {tuple(where.shape)}')
+        return where.bool()
+
+    ep_np = episode_indices.numpy()
+    getters: dict[str, Callable[[], Tensor]] = {}
+
+    for name in replay_buffer.fieldnames:
+        getters[name] = lambda n = name: from_numpy(replay_buffer.data[n][ep_np, :max_timesteps])
+
+    for name in replay_buffer.meta_fieldnames - replay_buffer.internal_meta_fieldnames:
+        def _get_meta(n = name):
+            vals = from_numpy(replay_buffer.meta_data[n][ep_np])
+            return vals.unsqueeze(1).expand(expected_shape[0], expected_shape[1], *vals.shape[1:])
+        getters[name] = _get_meta
+
+    if replay_buffer.track_write_step:
+        getters['_write_step'] = lambda: from_numpy(replay_buffer._write_steps[ep_np, :max_timesteps])
+        getters['_age'] = lambda: replay_buffer.global_step - 1 - from_numpy(replay_buffer._write_steps[ep_np, :max_timesteps])
+
+    mask = where(_LazyFieldView(getters))
+    if not is_tensor(mask):
+        mask = from_numpy(np.asarray(mask))
+    mask = mask.bool()
+
+    if tuple(mask.shape) != expected_shape:
+        raise ValueError(f'where predicate must return shape {expected_shape}, got {tuple(mask.shape)}')
+
+    return mask
+
+def episode_ages_tensor(replay_buffer: ReplayBufferBase, episode_indices: Tensor, max_timesteps: int) -> Tensor:
+    if not replay_buffer.track_write_step:
+        raise ValueError('min_age / max_age requires `track_write_step = True` on ReplayBuffer (or use StreamReplayBuffer)')
+
+    if episode_indices.numel() == 0 or max_timesteps == 0:
+        return torch.empty((episode_indices.numel(), max_timesteps), dtype = torch.int64)
+
+    write_steps = from_numpy(replay_buffer._write_steps[episode_indices.numpy(), :max_timesteps])
+    return replay_buffer.global_step - 1 - write_steps
 
 class ReplayDatasetBase(Dataset):
     def __init__(
@@ -364,6 +714,160 @@ class ReplayDatasetTimeWindow(ReplayDatasetBase):
 
         return data
 
+def build_episode_valid_mask(
+    replay_buffer: ReplayBufferBase,
+    episode_indices: Tensor,
+    episode_lens: Tensor,
+    horizon: int = 1,
+    strict_horizon: bool = True,
+    filter_fields: dict | None = None,
+    where: Callable | Tensor | None = None,
+    window_filter_mode: WindowFilterMode = 'start',
+    min_age: int | None = None,
+    max_age: int | None = None,
+    fallback_on_empty: bool = False
+) -> tuple[Tensor, Tensor]:
+    if horizon < 1:
+        raise ValueError(f'horizon must be >= 1, got {horizon}')
+
+    if window_filter_mode not in ('start', 'all', 'any'):
+        raise ValueError(f'window_filter_mode must be one of ("start", "all", "any"), got {window_filter_mode!r}')
+
+    grid_horizon = horizon if strict_horizon else 1
+    episode_timesteps, valid_mask = episode_timestep_grid(episode_indices, episode_lens, horizon = grid_horizon)
+    num_starts = valid_mask.shape[1]
+    max_len = int(episode_lens.amax()) if episode_lens.numel() > 0 else 0
+
+    has_step_filter = exists(filter_fields) or exists(where)
+
+    if has_step_filter and num_starts > 0:
+        if horizon == 1 or window_filter_mode == 'start':
+            if exists(filter_fields):
+                valid_mask &= filter_fields_mask(replay_buffer.data, episode_indices, num_starts, filter_fields)
+            if exists(where):
+                valid_mask &= eval_where_mask_episode(replay_buffer, episode_indices, num_starts, where)
+        else:
+            step_mask = arange(max_len)[None, :] < episode_lens[:, None]
+            if exists(filter_fields):
+                step_mask &= filter_fields_mask(replay_buffer.data, episode_indices, max_len, filter_fields)
+            if exists(where):
+                step_mask &= eval_where_mask_episode(replay_buffer, episode_indices, max_len, where)
+
+            target_lens = None
+            if not strict_horizon:
+                target_lens = (episode_lens[:, None] - arange(max_len)[None, :]).clamp(min = 1, max = horizon)
+
+            win_mask = rolling_window_mask(
+                step_mask,
+                horizon = horizon,
+                mode = window_filter_mode,
+                circular = False,
+                target_lens = target_lens
+            )
+            valid_mask &= win_mask[:, :num_starts]
+
+    if exists(min_age) or exists(max_age):
+        ages = episode_ages_tensor(replay_buffer, episode_indices, num_starts)
+        aged_mask = valid_mask & age_filter_mask(ages, min_age = min_age, max_age = max_age)
+
+        if not (fallback_on_empty and not aged_mask.any()):
+            valid_mask = aged_mask
+
+    return episode_timesteps, valid_mask
+
+class ReplayDatasetWindow(ReplayDatasetBase):
+    """ window-uniform contiguous sequence dataset over valid (episode, start_t) pairs """
+
+    def __init__(
+        self,
+        replay_buffer,
+        horizon: int,
+        strict_horizon: bool = True,
+        fields: tuple[str, ...] | None = None,
+        last_fields: tuple[str, ...] | None = None,
+        fieldname_map: dict[str, str] | None = None,
+        return_indices: bool = False,
+        include_metadata: bool = True,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        window_filter_mode: WindowFilterMode = 'start',
+        min_age: int | None = None,
+        max_age: int | None = None,
+        **kwargs
+    ):
+        if horizon < 1:
+            raise ValueError(f'horizon must be >= 1, got {horizon}')
+
+        min_episode_len = max(kwargs.pop('min_episode_len', 1), horizon if strict_horizon else 1)
+
+        super().__init__(
+            replay_buffer,
+            fields = fields,
+            fieldname_map = fieldname_map,
+            include_metadata = include_metadata,
+            filter_meta = filter_meta,
+            min_episode_len = min_episode_len,
+            **kwargs
+        )
+
+        self.horizon = horizon
+        self.strict_horizon = strict_horizon
+        self.last_fields = default(last_fields, ())
+        self.return_indices = return_indices
+
+        for field in self.last_fields:
+            if field not in self.replay_buffer.fieldnames:
+                raise ValueError(f'invalid last_field `{field}` - must be one of {self.replay_buffer.fieldnames}')
+
+        valid_episodes = self.indices
+        valid_episode_lens = from_numpy(self.replay_buffer.episode_lens)[valid_episodes]
+
+        episode_timesteps, valid_starts = build_episode_valid_mask(
+            self.replay_buffer,
+            valid_episodes,
+            valid_episode_lens,
+            horizon = horizon,
+            strict_horizon = strict_horizon,
+            filter_fields = filter_fields,
+            where = where,
+            window_filter_mode = window_filter_mode,
+            min_age = min_age,
+            max_age = max_age,
+        )
+
+        self.timepoints = episode_timesteps[valid_starts]
+
+    def __len__(self):
+        return len(self.timepoints)
+
+    def __getitem__(self, idx):
+        ep, t = self.timepoints[idx].tolist()
+        ep_len = int(self.replay_buffer.episode_lens[ep])
+        actual_len = self.horizon if self.strict_horizon else min(self.horizon, ep_len - t)
+
+        data = dict()
+
+        for field in self.fields:
+            seq = from_numpy(self.replay_buffer.data[field][ep, t:t + actual_len].copy())
+            if not self.strict_horizon:
+                seq = pad_right_at_dim_to(seq, self.horizon)
+            data[self.out_name(field)] = seq
+
+        for field in self.last_fields:
+            name = self.out_name(f'last_{field}')
+            data[name] = from_numpy(self.replay_buffer.data[field][ep, t + actual_len - 1].copy())
+
+        data.update(self.meta_values(ep))
+
+        if not self.strict_horizon:
+            data['_lens'] = tensor(actual_len, dtype = torch.long)
+
+        if self.return_indices:
+            data['_indices'] = self.timepoints[idx]
+
+        return data
+
 class ReplayDatasetTimestep(ReplayDatasetBase):
     def __init__(
         self,
@@ -374,6 +878,9 @@ class ReplayDatasetTimestep(ReplayDatasetBase):
         include_metadata = True,
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        min_age: int | None = None,
+        max_age: int | None = None,
         **kwargs
     ):
         super().__init__(
@@ -390,10 +897,17 @@ class ReplayDatasetTimestep(ReplayDatasetBase):
         valid_episodes = self.indices
         valid_episode_lens = from_numpy(self.replay_buffer.episode_lens)[valid_episodes]
 
-        episode_timesteps, valid_timesteps = episode_timestep_grid(valid_episodes, valid_episode_lens)
-
-        if exists(filter_fields):
-            valid_timesteps &= filter_fields_mask(self.replay_buffer.data, valid_episodes, valid_timesteps.shape[1], filter_fields)
+        episode_timesteps, valid_timesteps = build_episode_valid_mask(
+            self.replay_buffer,
+            valid_episodes,
+            valid_episode_lens,
+            horizon = 1,
+            strict_horizon = True,
+            filter_fields = filter_fields,
+            where = where,
+            min_age = min_age,
+            max_age = max_age,
+        )
 
         self.timepoints = episode_timesteps[valid_timesteps]
 
@@ -428,6 +942,9 @@ class ReplayDatasetNStep(ReplayDatasetBase):
         include_metadata = True,
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        min_age: int | None = None,
+        max_age: int | None = None,
         **kwargs
     ):
         # need at least 2 timesteps for a valid transition
@@ -451,10 +968,18 @@ class ReplayDatasetNStep(ReplayDatasetBase):
         valid_episodes = self.indices
         valid_episode_lens = from_numpy(self.replay_buffer.episode_lens)[valid_episodes]
 
-        episode_timesteps, valid_timesteps = episode_timestep_grid(valid_episodes, valid_episode_lens, horizon = 2)
-
-        if exists(filter_fields):
-            valid_timesteps &= filter_fields_mask(self.replay_buffer.data, valid_episodes, valid_timesteps.shape[1], filter_fields)
+        episode_timesteps, valid_timesteps = build_episode_valid_mask(
+            self.replay_buffer,
+            valid_episodes,
+            valid_episode_lens,
+            horizon = 2,
+            strict_horizon = True,
+            filter_fields = filter_fields,
+            where = where,
+            window_filter_mode = 'start',
+            min_age = min_age,
+            max_age = max_age,
+        )
 
         self.timepoints = episode_timesteps[valid_timesteps]
 
@@ -512,7 +1037,7 @@ class ReplayBufferBase:
     @beartype
     def __init__(
         self,
-        folder: str | Path,
+        folder: str | Path | None,
         max_episodes: int,
         max_timesteps: int,
         fields: dict[str, FieldInfo],
@@ -521,42 +1046,54 @@ class ReplayBufferBase:
         overwrite = True,
         read_only = False,
         flush_every_store_step: int = 1,
+        track_write_step: bool = False,
         **extra_config: Any
     ):
         meta_fields = default(meta_fields, dict())
+
+        self.in_memory = not exists(folder)
+
+        if self.in_memory and read_only:
+            raise ValueError('cannot open an in-memory buffer in read-only mode')
 
         assert not (read_only and overwrite), 'cannot overwrite a buffer in read-only mode'
 
         if flush_every_store_step < 0:
             raise ValueError(f'flush_every_store_step must be >= 0, got {flush_every_store_step}')
 
-        self.folder = Path(folder)
+        self.folder = Path(folder) if exists(folder) else None
         self.read_only = read_only
         self.max_episodes = max_episodes
         self.max_timesteps = max_timesteps
         self.circular = circular
+        self.track_write_step = track_write_step
 
         self.store_step = 0
-        self.should_flush = flush_every_store_step > 0
+        self.should_flush = (not self.in_memory) and flush_every_store_step > 0
         self.flush_every_store_step = flush_every_store_step
 
-        if read_only:
-            assert self.folder.is_dir(), f'cannot open folder `{self.folder}` in read-only mode - folder does not exist'
-        else:
-            self.folder.mkdir(exist_ok = True, parents = True)
+        if not self.in_memory:
+            if read_only:
+                assert self.folder.is_dir(), f'cannot open folder `{self.folder}` in read-only mode - folder does not exist'
+            else:
+                self.folder.mkdir(exist_ok = True, parents = True)
 
-        assert self.folder.is_dir()
+            assert self.folder.is_dir()
 
-        config = dict(
-            max_episodes = max_episodes,
-            max_timesteps = max_timesteps,
-            fields = fields,
-            meta_fields = meta_fields,
-            circular = circular,
-            **extra_config
-        )
+            config = dict(
+                max_episodes = max_episodes,
+                max_timesteps = max_timesteps,
+                fields = fields,
+                meta_fields = meta_fields,
+                circular = circular,
+                **extra_config
+            )
 
-        load_or_write_config(self.folder, config, overwrite)
+            # keep legacy metadata.pkl identical when track_write_step is disabled
+            if track_write_step:
+                config['track_write_step'] = True
+
+            load_or_write_config(self.folder, config, overwrite)
 
         self._init_state(overwrite, extra_config)
         self._init_fields(fields, meta_fields, overwrite)
@@ -571,6 +1108,9 @@ class ReplayBufferBase:
 
         with open(str(config_path), 'rb') as f:
             config = pickle.load(f)
+
+        if config.get('buffer_type') == 'stream':
+            raise ValueError(f'buffer at `{folder}` is a StreamReplayBuffer - open it with `StreamReplayBuffer.from_folder`')
 
         return cls(folder, overwrite = False, read_only = read_only, **config)
 
@@ -587,6 +1127,9 @@ class ReplayBufferBase:
     def _open_array(self, name, shape, dtype, is_meta, overwrite):
         raise NotImplementedError
 
+    def _open_internal_array(self, name, shape, dtype, overwrite, fill_value = None):
+        raise NotImplementedError
+
     def _fill_default(self, array, indices, default_value):
         array[indices] = np.full((len(indices), *array.shape[1:]), default_value, dtype = array.dtype)
 
@@ -595,6 +1138,16 @@ class ReplayBufferBase:
 
     def _close_storage(self):
         pass
+
+    def _gather_meta(self, array, ep_indices: ndarray) -> ndarray:
+        return np.asarray(array[ep_indices])
+
+    def _gather_timesteps(self, array, ep_indices: ndarray, time_indices: ndarray) -> ndarray:
+        return np.asarray(array[ep_indices, time_indices])
+
+    def _gather_windows(self, array, ep_indices: ndarray, start_times: ndarray, horizon: int) -> ndarray:
+        time_grid = np.minimum(start_times[:, None] + np.arange(horizon)[None, :], self.max_timesteps - 1)
+        return np.asarray(array[ep_indices[:, None], time_grid])
 
     # internal setup
 
@@ -636,6 +1189,16 @@ class ReplayBufferBase:
             self.dtypes[field_name] = dtype
             self.defaults[field_name] = default_value
 
+        self._write_steps = None
+        if self.track_write_step:
+            self._write_steps = self._open_internal_array(
+                'write_steps',
+                (self.max_episodes, self.max_timesteps),
+                np.int64,
+                overwrite = overwrite,
+                fill_value = -1
+            )
+
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
     def _full_message(self):
@@ -662,13 +1225,15 @@ class ReplayBufferBase:
     def __len__(self):
         return int((self.episode_lens[:] > 0).sum())
 
+    def _sync_episode_len(self):
+        if not self.read_only and self.timestep_index > 0:
+            self.episode_lens[self.episode_index] = self.timestep_index
+
     def flush(self):
         if self.read_only:
             return
 
-        if self.timestep_index > 0:
-            self.episode_lens[self.episode_index] = self.timestep_index
-
+        self._sync_episode_len()
         self._flush_storage()
 
     @can_write
@@ -683,6 +1248,10 @@ class ReplayBufferBase:
         self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
+
+        if self.track_write_step:
+            self._write_steps[:] = -1
+            self.global_step = 0
 
     @can_write
     def advance_episode(self, batch_size = 1):
@@ -730,6 +1299,9 @@ class ReplayBufferBase:
 
         for name, array in self.data.items():
             self._fill_default(array, uninit_indices, default(self.defaults[name], 0))
+
+        if self.track_write_step:
+            self._fill_default(self._write_steps, uninit_indices, -1)
 
         self._initted[uninit_indices] = True
 
@@ -789,6 +1361,12 @@ class ReplayBufferBase:
                 self.store_batch_datapoint(indices, self.timestep_index, name, values[order])
 
         if not is_meta:
+            if self.track_write_step:
+                start_step = self.global_step
+                steps = np.arange(start_step, start_step + batch_size, dtype = np.int64)
+                self._write_steps[indices, self.timestep_index] = steps[order]
+                self.global_step = start_step + batch_size
+
             self.episode_lens[indices] = self.timestep_index + 1
             self.timestep_index += 1
 
@@ -923,6 +1501,10 @@ class ReplayBufferBase:
             store_data[name] = datapoint
             self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
 
+        if self.track_write_step:
+            self._write_steps[self.episode_index, self.timestep_index] = self.global_step
+            self.global_step = self.global_step + 1
+
         self.timestep_index += 1
         self.store_step += 1
 
@@ -981,6 +1563,11 @@ class ReplayBufferBase:
 
         if not exists(time_dim):
             raise ValueError('At least one time-varying field must be provided to store_episode')
+
+        if self.track_write_step:
+            start_step = self.global_step
+            self._write_steps[self.episode_index, :time_dim] = np.arange(start_step, start_step + time_dim, dtype = np.int64)
+            self.global_step = start_step + time_dim
 
         self.timestep_index = time_dim
         self.advance_episode()
@@ -1062,7 +1649,7 @@ class ReplayBufferBase:
         meta_fields: tuple[str, ...] | None = None,
         device: torch.device | str | None = None
     ):
-        self.flush()
+        self._sync_episode_len()
 
         n = self.num_episodes
 
@@ -1090,29 +1677,309 @@ class ReplayBufferBase:
 
         return tree_map_to_device(all_data, device)
 
+    def _sample_mixture(
+        self,
+        mixture: Sequence[tuple[float, dict[str, Any]]],
+        batch_size: int,
+        base_mask: Tensor,
+        valid_episodes: Tensor,
+        valid_episode_lens: Tensor,
+        min_ep_len: int,
+        eff_horizon: int,
+        eff_strict: bool,
+        window_filter_mode: WindowFilterMode,
+        replacement: bool
+    ) -> tuple[Tensor, Tensor]:
+        allowed_keys = {'min_age', 'max_age', 'filter_fields', 'filter_meta', 'where', 'window_filter_mode'}
+        counts = resolve_mixture_counts(batch_size, [w for w, _ in mixture])
+        all_rows, all_cols = [], []
+
+        for (_, stratum), count in zip(mixture, counts, strict = True):
+            if count == 0:
+                continue
+
+            unknown = set(stratum.keys()) - allowed_keys
+            if unknown:
+                raise ValueError(f'unknown mixture stratum keys {unknown} - allowed: {allowed_keys}')
+
+            stratum_mask = base_mask
+
+            s_filter_meta = stratum.get('filter_meta')
+            if exists(s_filter_meta):
+                s_ep_mask = episode_filter_mask(self, filter_meta = s_filter_meta, min_episode_len = min_ep_len)[valid_episodes]
+                stratum_mask = stratum_mask & s_ep_mask[:, None]
+
+            s_filter_fields = stratum.get('filter_fields')
+            s_where = stratum.get('where')
+            s_min_age = stratum.get('min_age')
+            s_max_age = stratum.get('max_age')
+            s_win_mode = stratum.get('window_filter_mode', window_filter_mode)
+
+            if any(exists(v) for v in (s_filter_fields, s_where, s_min_age, s_max_age)):
+                _, sub_mask = build_episode_valid_mask(
+                    self,
+                    valid_episodes,
+                    valid_episode_lens,
+                    horizon = eff_horizon,
+                    strict_horizon = eff_strict,
+                    filter_fields = s_filter_fields,
+                    where = s_where,
+                    window_filter_mode = s_win_mode,
+                    min_age = s_min_age,
+                    max_age = s_max_age,
+                    fallback_on_empty = False,
+                )
+                stratum_mask = stratum_mask & sub_mask
+
+            if not stratum_mask.any():
+                stratum_mask = base_mask
+
+            rows, cols = select_indices_from_mask(stratum_mask, count, replacement = replacement)
+            all_rows.append(rows)
+            all_cols.append(cols)
+
+        return torch.cat(all_rows, dim = 0), torch.cat(all_cols, dim = 0)
+
+    @beartype
+    def sample(
+        self,
+        batch_size: int,
+        horizon: int | None = None,
+        *,
+        timestep_level: bool | None = None,
+        strict_horizon: bool = True,
+        fields: tuple[str, ...] | None = None,
+        last_fields: tuple[str, ...] | None = None,
+        include_metadata: bool = True,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        window_filter_mode: WindowFilterMode = 'start',
+        min_age: int | None = None,
+        max_age: int | None = None,
+        mixture: Sequence[tuple[float, dict[str, Any]]] | None = None,
+        replacement: bool = True,
+        allow_empty: bool = False,
+        fallback_on_empty: bool = False,
+        return_indices: bool = False,
+        return_mask: bool = False,
+        fieldname_map: dict[str, str] | None = None,
+        to_named_tuple: bool | tuple[str, ...] | None = None,
+        device: torch.device | str | None = None
+    ):
+        validate_sample_args(batch_size, horizon, timestep_level, last_fields, return_mask)
+
+        self._sync_episode_len()
+
+        if len(self) == 0:
+            if allow_empty:
+                return None
+            raise ValueError('replay buffer is empty')
+
+        fieldname_map = default(fieldname_map, dict())
+        user_meta_names = tuple(sorted(self.meta_fieldnames - self.internal_meta_fieldnames))
+
+        sample_fields, sample_last_fields, sample_meta_fields, return_mask, return_indices = resolve_sample_fields(
+            self.fieldnames,
+            horizon = horizon,
+            fields = fields,
+            last_fields = last_fields,
+            fieldname_map = fieldname_map,
+            to_named_tuple = to_named_tuple,
+            return_mask = return_mask,
+            return_indices = return_indices,
+            user_meta_names = user_meta_names,
+            include_metadata = include_metadata,
+        )
+
+        eff_horizon = default(horizon, 1)
+        eff_strict = strict_horizon if exists(horizon) else True
+        min_ep_len = eff_horizon if (exists(horizon) and strict_horizon) else 1
+
+        ep_mask = episode_filter_mask(self, filter_meta = filter_meta, min_episode_len = min_ep_len)
+        valid_episodes = arange(self.max_episodes)[ep_mask]
+        valid_episode_lens = from_numpy(self.episode_lens)[valid_episodes]
+
+        _, base_mask = build_episode_valid_mask(
+            self,
+            valid_episodes,
+            valid_episode_lens,
+            horizon = eff_horizon,
+            strict_horizon = eff_strict,
+            filter_fields = filter_fields,
+            where = where,
+            window_filter_mode = window_filter_mode,
+            min_age = min_age,
+            max_age = max_age,
+            fallback_on_empty = fallback_on_empty,
+        )
+
+        if not base_mask.any():
+            if allow_empty:
+                return None
+            raise ValueError('no valid samples matched the query')
+
+        if exists(mixture):
+            picked_rows, picked_cols = self._sample_mixture(
+                mixture,
+                batch_size,
+                base_mask,
+                valid_episodes,
+                valid_episode_lens,
+                min_ep_len,
+                eff_horizon,
+                eff_strict,
+                window_filter_mode,
+                replacement,
+            )
+        else:
+            picked_rows, picked_cols = select_indices_from_mask(base_mask, batch_size, replacement = replacement)
+
+        ep_indices_t = valid_episodes[picked_rows]
+        ep_indices_np = ep_indices_t.numpy()
+        time_indices_np = picked_cols.numpy()
+
+        def out_name(name):
+            return fieldname_map.get(name, name)
+
+        batch = dict()
+
+        if exists(horizon):
+            ep_lens_picked = np.asarray(self.episode_lens)[ep_indices_np]
+
+            if strict_horizon:
+                actual_lens_np = np.full(batch_size, horizon, dtype = np.int64)
+            else:
+                actual_lens_np = np.minimum(horizon, ep_lens_picked - time_indices_np).astype(np.int64)
+
+            valid_pos = np.arange(horizon)[None, :] < actual_lens_np[:, None]
+
+            for name in sample_fields:
+                gathered = self._gather_windows(self.data[name], ep_indices_np, time_indices_np, horizon)
+                if not strict_horizon:
+                    gathered = gathered.copy()
+                    gathered[~valid_pos] = 0
+                batch[out_name(name)] = from_numpy(gathered)
+
+            last_times_np = time_indices_np + actual_lens_np - 1
+
+            for name in sample_last_fields:
+                gathered = self._gather_timesteps(self.data[name], ep_indices_np, last_times_np)
+                batch[out_name(f'last_{name}')] = from_numpy(gathered)
+
+            if not strict_horizon:
+                batch['_lens'] = from_numpy(actual_lens_np)
+
+            if return_mask:
+                batch['_mask'] = from_numpy(valid_pos)
+        else:
+            for name in sample_fields:
+                gathered = self._gather_timesteps(self.data[name], ep_indices_np, time_indices_np)
+                batch[out_name(name)] = from_numpy(gathered)
+
+        for name in sample_meta_fields:
+            gathered = self._gather_meta(self.meta_data[name], ep_indices_np)
+            batch[out_name(name)] = from_numpy(gathered)
+
+        if return_indices:
+            batch['_indices'] = stack((ep_indices_t, picked_cols), dim = -1)
+
+        return format_batch(batch, to_named_tuple = to_named_tuple, device = device)
+
+    @beartype
+    def field_stats(
+        self,
+        field: str,
+        *,
+        filter_meta: dict | None = None,
+        filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        min_age: int | None = None,
+        max_age: int | None = None,
+        chunk_episodes: int = 256
+    ) -> FieldStats:
+        if field not in self.fieldnames:
+            raise ValueError(f'invalid field `{field}` - must be one of {self.fieldnames}')
+
+        if chunk_episodes <= 0:
+            raise ValueError(f'chunk_episodes must be positive, got {chunk_episodes}')
+
+        self._sync_episode_len()
+
+        acc = _StatsAccumulator(self.shapes[field])
+
+        if len(self) == 0:
+            return acc.finalize()
+
+        ep_mask = episode_filter_mask(self, filter_meta = filter_meta, min_episode_len = 1)
+        valid_episodes = arange(self.max_episodes)[ep_mask]
+
+        if valid_episodes.numel() == 0:
+            return acc.finalize()
+
+        ep_lens_all = from_numpy(self.episode_lens)
+
+        for start in range(0, valid_episodes.numel(), chunk_episodes):
+            chunk_eps = valid_episodes[start:start + chunk_episodes]
+            chunk_lens = ep_lens_all[chunk_eps]
+            max_len = int(chunk_lens.amax())
+
+            if max_len == 0:
+                continue
+
+            _, valid_mask = build_episode_valid_mask(
+                self,
+                chunk_eps,
+                chunk_lens,
+                horizon = 1,
+                strict_horizon = True,
+                filter_fields = filter_fields,
+                where = where,
+                min_age = min_age,
+                max_age = max_age,
+            )
+
+            if not valid_mask.any():
+                continue
+
+            chunk_vals = np.asarray(self.data[field][chunk_eps.numpy(), :max_len])
+            acc.update(chunk_vals[valid_mask.numpy()])
+
+        return acc.finalize()
+
     @beartype
     def dataset(
         self,
         n_steps: int | None = None,
+        horizon: int | None = None,
+        strict_horizon: bool = True,
         fields: tuple[str, ...] | None = None,
         current_fields: tuple[str, ...] | None = None,
         next_fields: tuple[str, ...] | None = None,
         sequence_fields: tuple[str, ...] | None = None,
+        last_fields: tuple[str, ...] | None = None,
         timestep_level = False,
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        window_filter_mode: WindowFilterMode = 'start',
+        min_age: int | None = None,
+        max_age: int | None = None,
         fieldname_map: dict[str, str] | None = None,
         slice_by_episode_len = True,
         return_episode_lens = True,
         **kwargs
     ) -> Dataset:
-        self.flush()
+        self._sync_episode_len()
 
         if len(self) == 0:
             raise ValueError('replay buffer is empty')
 
-        if exists(n_steps) and timestep_level:
-            raise ValueError('cannot specify both n_steps and timestep_level')
+        num_modes = sum((exists(n_steps), bool(timestep_level), exists(horizon)))
+        if num_modes > 1:
+            if exists(n_steps) and timestep_level:
+                raise ValueError('cannot specify both n_steps and timestep_level')
+            raise ValueError('can specify at most one of n_steps, timestep_level, or horizon')
 
         if exists(n_steps):
             return ReplayDatasetNStep(
@@ -1123,6 +1990,26 @@ class ReplayBufferBase:
                 sequence_fields = sequence_fields,
                 filter_meta = filter_meta,
                 filter_fields = filter_fields,
+                where = where,
+                min_age = min_age,
+                max_age = max_age,
+                fieldname_map = fieldname_map,
+                **kwargs
+            )
+
+        if exists(horizon):
+            return ReplayDatasetWindow(
+                self,
+                horizon = horizon,
+                strict_horizon = strict_horizon,
+                fields = fields,
+                last_fields = last_fields,
+                filter_meta = filter_meta,
+                filter_fields = filter_fields,
+                where = where,
+                window_filter_mode = window_filter_mode,
+                min_age = min_age,
+                max_age = max_age,
                 fieldname_map = fieldname_map,
                 **kwargs
             )
@@ -1133,6 +2020,9 @@ class ReplayBufferBase:
                 fields = fields,
                 filter_meta = filter_meta,
                 filter_fields = filter_fields,
+                where = where,
+                min_age = min_age,
+                max_age = max_age,
                 fieldname_map = fieldname_map,
                 **kwargs
             )
@@ -1153,18 +2043,25 @@ class ReplayBufferBase:
         self,
         batch_size,
         n_steps: int | None = None,
+        horizon: int | None = None,
+        strict_horizon: bool = True,
         dataset: Dataset | None = None,
         fields: tuple[str, ...] | None = None,
         current_fields: tuple[str, ...] | None = None,
         next_fields: tuple[str, ...] | None = None,
         sequence_fields: tuple[str, ...] | None = None,
+        last_fields: tuple[str, ...] | None = None,
         filter_meta: dict | None = None,
         filter_fields: dict | None = None,
+        where: Callable | Tensor | None = None,
+        window_filter_mode: WindowFilterMode = 'start',
+        min_age: int | None = None,
+        max_age: int | None = None,
         fieldname_map: dict[str, str] | None = None,
         return_indices: bool = False,
         return_mask: bool = False,
         timestep_level = False,
-        to_named_tuple: tuple[str, ...] | None = None,
+        to_named_tuple: bool | tuple[str, ...] | None = None,
         shuffle = False,
         device: torch.device | str | None = None,
         dataset_kwargs: dict | None = None,
@@ -1172,40 +2069,51 @@ class ReplayBufferBase:
     ) -> DataLoader:
         dataset_kwargs = default(dataset_kwargs, dict())
 
-        self.flush()
+        if hasattr(self, '_sync_episode_len'):
+            self._sync_episode_len()
 
         if len(self) == 0:
             raise ValueError('replay buffer is empty')
 
-        # if to_named_tuple is specified, don't filter dataset fields
+        # if to_named_tuple is a tuple of names, don't filter dataset fields
 
-        if exists(to_named_tuple) and exists(fields):
+        if isinstance(to_named_tuple, tuple) and exists(fields):
             raise ValueError('cannot specify both fields and to_named_tuple')
 
         if return_mask and (timestep_level or exists(n_steps)):
-            raise ValueError('return_mask is only supported for trajectory-level data')
+            raise ValueError('return_mask is only supported for trajectory-level or horizon window data')
 
-        if exists(n_steps) and timestep_level:
-            raise ValueError('cannot specify both n_steps and timestep_level')
+        num_modes = sum((exists(n_steps), bool(timestep_level), exists(horizon)))
+        if num_modes > 1:
+            if exists(n_steps) and timestep_level:
+                raise ValueError('cannot specify both n_steps and timestep_level')
+            raise ValueError('can specify at most one of n_steps, timestep_level, or horizon')
 
         if not exists(dataset):
             dataset = self.dataset(
                 n_steps = n_steps,
+                horizon = horizon,
+                strict_horizon = strict_horizon,
                 fields = fields,
                 current_fields = current_fields,
                 next_fields = next_fields,
                 sequence_fields = sequence_fields,
+                last_fields = last_fields,
                 timestep_level = timestep_level,
                 return_indices = return_indices,
                 filter_meta = filter_meta,
                 filter_fields = filter_fields,
+                where = where,
+                window_filter_mode = window_filter_mode,
+                min_age = min_age,
+                max_age = max_age,
                 fieldname_map = fieldname_map,
                 **dataset_kwargs
             )
 
         # only data fields are padded to the longest trajectory
 
-        if exists(n_steps) or timestep_level:
+        if exists(n_steps) or timestep_level or exists(horizon):
             base_collate_fn = None
         else:
             fields_to_pad = self.fieldnames
@@ -1214,11 +2122,6 @@ class ReplayBufferBase:
 
             base_collate_fn = partial(collate_var_time, fields_to_pad = fields_to_pad)
 
-        NamedTupleCls = None
-        if exists(to_named_tuple):
-            sanitized_fields = tuple(f.lstrip('_') if f.startswith('_') else f for f in to_named_tuple)
-            NamedTupleCls = namedtuple('Batch', sanitized_fields)
-
         def collate_fn(data):
             if exists(base_collate_fn):
                 batch = base_collate_fn(data)
@@ -1226,18 +2129,18 @@ class ReplayBufferBase:
                 batch = default_collate(data)
 
             if return_mask:
-                lens = batch['_lens']
-                max_len = lens.amax().item()
-                batch['_mask'] = einx.less('j, i -> i j', arange(max_len, device = lens.device), lens)
+                if exists(horizon) and strict_horizon:
+                    b = next(iter(batch.values())).shape[0]
+                    batch['_mask'] = torch.ones((b, horizon), dtype = torch.bool)
+                elif exists(horizon):
+                    lens = batch['_lens']
+                    batch['_mask'] = einx.less('j, i -> i j', arange(horizon, device = lens.device), lens)
+                else:
+                    lens = batch['_lens']
+                    max_len = lens.amax().item()
+                    batch['_mask'] = einx.less('j, i -> i j', arange(max_len, device = lens.device), lens)
 
-            if exists(to_named_tuple):
-                for field in to_named_tuple:
-                    if field not in batch:
-                        raise ValueError(f'field `{field}` not found in batch. available fields: {list(batch.keys())}')
-
-                batch = NamedTupleCls(**{san: batch[orig] for orig, san in zip(to_named_tuple, sanitized_fields)})
-
-            return tree_map_to_device(batch, device)
+            return format_batch(batch, to_named_tuple = to_named_tuple, device = device)
 
         return DataLoader(dataset, batch_size = batch_size, collate_fn = collate_fn, shuffle = shuffle, **kwargs)
 
@@ -1311,6 +2214,14 @@ class ReplayBufferBase:
 class ReplayBuffer(ReplayBufferBase):
 
     def _init_state(self, overwrite, extra_config):
+        if self.in_memory:
+            for name in ('num_episodes', 'episode_index', 'timestep_index'):
+                setattr(self, f'_{name}', np.array(0, dtype = np.int32))
+
+            if self.track_write_step:
+                self._global_step = np.array(0, dtype = np.int64)
+            return
+
         for name in ('num_episodes', 'episode_index', 'timestep_index'):
             path = self.folder / f'{name}.state.npy'
 
@@ -1322,6 +2233,17 @@ class ReplayBuffer(ReplayBufferBase):
 
             setattr(self, f'_{name}', open_memmap(str(path), mode = mode, dtype = np.int32, shape = ()))
 
+        if self.track_write_step:
+            path = self.folder / 'global_step.state.npy'
+
+            if self.read_only:
+                assert path.exists(), f'state file `{path}` not found - cannot open in read-only mode'
+                mode = 'r'
+            else:
+                mode = 'w+' if overwrite or not path.exists() else 'r+'
+
+            self._global_step = open_memmap(str(path), mode = mode, dtype = np.int64, shape = ())
+
     @property
     def num_episodes(self):
         return self._num_episodes.item()
@@ -1329,7 +2251,8 @@ class ReplayBuffer(ReplayBufferBase):
     @num_episodes.setter
     def num_episodes(self, value):
         self._num_episodes[()] = value
-        self._num_episodes.flush()
+        if self.should_flush:
+            self._num_episodes.flush()
 
     @property
     def episode_index(self):
@@ -1338,7 +2261,8 @@ class ReplayBuffer(ReplayBufferBase):
     @episode_index.setter
     def episode_index(self, value):
         self._episode_index[()] = value
-        self._episode_index.flush()
+        if self.should_flush:
+            self._episode_index.flush()
 
     @property
     def timestep_index(self):
@@ -1347,9 +2271,23 @@ class ReplayBuffer(ReplayBufferBase):
     @timestep_index.setter
     def timestep_index(self, value):
         self._timestep_index[()] = value
-        self._timestep_index.flush()
+        if self.should_flush:
+            self._timestep_index.flush()
+
+    @property
+    def global_step(self):
+        return int(self._global_step.item())
+
+    @global_step.setter
+    def global_step(self, value):
+        self._global_step[()] = value
+        if self.should_flush:
+            self._global_step.flush()
 
     def _open_array(self, name, shape, dtype, is_meta, overwrite):
+        if self.in_memory:
+            return np.zeros(shape, dtype = dtype)
+
         filepath = self.folder / (f'{name}.data.meta.npy' if is_meta else f'{name}.data.npy')
 
         if self.read_only:
@@ -1360,15 +2298,44 @@ class ReplayBuffer(ReplayBufferBase):
 
         return open_memmap(str(filepath), mode = mode, dtype = dtype, shape = shape)
 
+    def _open_internal_array(self, name, shape, dtype, overwrite, fill_value = None):
+        if self.in_memory:
+            if exists(fill_value):
+                return np.full(shape, fill_value, dtype = dtype)
+            return np.zeros(shape, dtype = dtype)
+
+        filepath = self.folder / f'{name}.internal.npy'
+        is_new = overwrite or not filepath.exists()
+
+        if self.read_only:
+            assert filepath.exists(), f'`{filepath}` not found - cannot open in read-only mode'
+            mode = 'r'
+        else:
+            mode = 'w+' if is_new else 'r+'
+
+        arr = open_memmap(str(filepath), mode = mode, dtype = dtype, shape = shape)
+
+        if is_new and exists(fill_value) and not self.read_only:
+            arr[...] = fill_value
+
+        return arr
+
     def _fill_default(self, array, indices, default_value):
         # memmaps take a scalar directly, no need to materialize the whole selection
 
         array[indices] = default_value
 
     def _flush_storage(self):
+        if self.in_memory:
+            return
+
         for memmap in (*self.data.values(), *self.meta_data.values()):
             memmap.flush()
 
         self._num_episodes.flush()
         self._episode_index.flush()
         self._timestep_index.flush()
+
+        if self.track_write_step:
+            self._write_steps.flush()
+            self._global_step.flush()

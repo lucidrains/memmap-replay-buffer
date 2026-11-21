@@ -85,6 +85,9 @@ class ConcatReplayBuffer:
     def flush(self):
         pass
 
+    def _sync_episode_len(self):
+        pass
+
     def _read_only(self, *args, **kwargs):
         raise NotImplementedError('ConcatReplayBuffer is read-only')
 

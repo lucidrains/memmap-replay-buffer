@@ -195,6 +195,73 @@ dataloader = buffer.dataloader(
 
 `demo_advantage_filtering.py` contains a complete self-play loop that computes advantages in batches, marks extreme positive advantages, and trains only on those timesteps.
 
+### Asynchronous multi-stream ring buffer & online sampling
+
+For vectorized off-policy or model-based RL where environments reset asynchronously and in-flight episodes must be sampled immediately, `StreamReplayBuffer` stores transitions in a `(num_streams, capacity)` circular ring (either disk-backed memmaps or in-memory with `folder = None`) with automatic monotonic `episode_id` and transition-age tracking.
+
+Both `StreamReplayBuffer` and `ReplayBuffer` support direct vectorized `sample(...)` (without `DataLoader` rebuild overhead), strict window-uniform contiguous sequences (`horizon`, `last_fields`), callable predicates in `filter_fields` / `filter_meta` / `where`, age bounds (`min_age` / `max_age`), stratified `mixture` sampling, and chunked masked `field_stats(...)`.
+
+```python
+from memmap_replay_buffer import StreamReplayBuffer
+
+buffer = StreamReplayBuffer(
+    folder = './stream_data',   # or None for pure in-memory
+    num_streams = 16,
+    capacity = 48_000,
+    fields = dict(
+        state = ('float', 8),
+        action = ('float', 2),
+        next_state = ('float', 8),
+        reward = 'float',
+        terminal = 'float',
+        is_real = ('bool', (), False),
+    )
+)
+
+# asynchronous per-env (or batched `store_steps`) writes with live in-flight episodes
+buffer.store_step(env_index, state = s, action = a, next_state = s_next, reward = r, terminal = float(terminated), is_real = True)
+if terminated or truncated:
+    buffer.end_episode(env_index)
+
+# strict unpadded horizon=8 windows, 35% recent + 65% uniform mixture
+wm_batch = buffer.sample(
+    batch_size = 256,
+    horizon = 8,
+    mixture = [(0.35, dict(max_age = 4_000)), (0.65, dict())],
+    fields = ('state', 'action', 'next_state', 'terminal', 'reward'),
+    to_named_tuple = True,
+    device = 'cuda'
+)
+
+# near-on-policy critic sequences with fallback + final next_state for (B, H + 1, D)
+critic_batch = buffer.sample(
+    batch_size = 256,
+    horizon = 16,
+    max_age = 600,
+    fallback_on_empty = True,
+    fields = ('state', 'terminal', 'reward'),
+    last_fields = ('next_state',),
+    to_named_tuple = True,
+    device = 'cuda'
+)
+
+# older real terminal anchors (returns None gracefully if none exist yet)
+term_batch = buffer.sample(
+    batch_size = 64,
+    min_age = 600,
+    filter_fields = dict(is_real = True, terminal = lambda x: x > 0.5),
+    fields = ('state', 'reward'),
+    allow_empty = True,
+    to_named_tuple = True,
+    device = 'cuda'
+)
+
+# chunked masked statistics (count, mean, std, rms, min, max)
+stats = buffer.field_stats('reward', filter_fields = dict(is_real = True))
+```
+
+On episode-major `ReplayBuffer` / `ReplayBufferH5PY`, pass `track_write_step = True` to enable `min_age` / `max_age` queries (off by default to keep existing `metadata.pkl` folders 100% compatible).
+
 ### Pulling everything at once
 
 ```python

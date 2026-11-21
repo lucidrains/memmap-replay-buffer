@@ -1,10 +1,14 @@
 from memmap_replay_buffer.concat_replay_buffer import ConcatReplayBuffer as ConcatReplayBuffer
+from memmap_replay_buffer.replay_buffer import FieldStats as FieldStats
 from memmap_replay_buffer.replay_buffer import ReplayBuffer as ReplayBuffer
 from memmap_replay_buffer.replay_buffer import ReplayDataset as ReplayDataset
 from memmap_replay_buffer.replay_buffer import ReplayDatasetNStep as ReplayDatasetNStep
 from memmap_replay_buffer.replay_buffer import ReplayDatasetTimestep as ReplayDatasetTimestep
 from memmap_replay_buffer.replay_buffer import ReplayDatasetTimeWindow as ReplayDatasetTimeWindow
 from memmap_replay_buffer.replay_buffer import ReplayDatasetTrajectory as ReplayDatasetTrajectory
+from memmap_replay_buffer.replay_buffer import ReplayDatasetWindow as ReplayDatasetWindow
+from memmap_replay_buffer.stream_replay_buffer import StreamReplayBuffer as StreamReplayBuffer
+from memmap_replay_buffer.stream_replay_buffer import StreamReplayDataset as StreamReplayDataset
 
 try:
     from memmap_replay_buffer.replay_buffer_h5py import ReplayBufferH5PY as ReplayBufferH5PY

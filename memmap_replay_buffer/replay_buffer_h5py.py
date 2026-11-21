@@ -63,6 +63,7 @@ class ReplayBufferH5PY(ReplayBufferBase):
         overwrite = True,
         read_only = False,
         flush_every_store_step: int = 1,
+        track_write_step: bool = False,
         h5py_compression: str | None = None,
         h5py_compression_opts: int | Any | None = None
     ):
@@ -76,6 +77,7 @@ class ReplayBufferH5PY(ReplayBufferBase):
             overwrite = overwrite,
             read_only = read_only,
             flush_every_store_step = flush_every_store_step,
+            track_write_step = track_write_step,
             h5py_compression = h5py_compression,
             h5py_compression_opts = h5py_compression_opts
         )
@@ -106,6 +108,9 @@ class ReplayBufferH5PY(ReplayBufferBase):
             self.file.attrs['episode_index'] = 0
             self.file.attrs['timestep_index'] = 0
 
+        if self.track_write_step and (overwrite or 'global_step' not in self.file.attrs):
+            self.file.attrs['global_step'] = np.int64(0)
+
     @property
     def num_episodes(self):
         return self.file.attrs['num_episodes']
@@ -130,6 +135,14 @@ class ReplayBufferH5PY(ReplayBufferBase):
     def timestep_index(self, value):
         self.file.attrs['timestep_index'] = value
 
+    @property
+    def global_step(self):
+        return int(self.file.attrs['global_step'])
+
+    @global_step.setter
+    def global_step(self, value):
+        self.file.attrs['global_step'] = np.int64(value)
+
     def _open_array(self, name, shape, dtype, is_meta, overwrite):
         dset_name = f'{"meta" if is_meta else "data"}_{name}'
 
@@ -151,6 +164,43 @@ class ReplayBufferH5PY(ReplayBufferBase):
             dset = self.file[dset_name]
 
         return H5DatasetProxy(dset)
+
+    def _open_internal_array(self, name, shape, dtype, overwrite, fill_value = None):
+        dset_name = f'internal_{name}'
+
+        if dset_name not in self.file:
+            dset = self.file.create_dataset(
+                dset_name,
+                shape = shape,
+                dtype = dtype,
+                fillvalue = fill_value if exists(fill_value) else 0
+            )
+        else:
+            dset = self.file[dset_name]
+
+        return H5DatasetProxy(dset)
+
+    def _gather_meta(self, array, ep_indices: ndarray) -> ndarray:
+        uniq, inv = np.unique(ep_indices, return_inverse = True)
+        return np.asarray(array[uniq])[inv]
+
+    def _gather_timesteps(self, array, ep_indices: ndarray, time_indices: ndarray) -> ndarray:
+        return np.stack([np.asarray(array[int(e), int(t)]) for e, t in zip(ep_indices, time_indices, strict = True)], axis = 0)
+
+    def _gather_windows(self, array, ep_indices: ndarray, start_times: ndarray, horizon: int) -> ndarray:
+        max_t = self.max_timesteps
+        chunks = []
+
+        for e, s in zip(ep_indices, start_times, strict = True):
+            e, s = int(e), int(s)
+            end = min(s + horizon, max_t)
+            chunk = np.asarray(array[e, s:end])
+            if chunk.shape[0] < horizon:
+                pad_shape = (horizon - chunk.shape[0], *chunk.shape[1:])
+                chunk = np.concatenate((chunk, np.zeros(pad_shape, dtype = chunk.dtype)), axis = 0)
+            chunks.append(chunk)
+
+        return np.stack(chunks, axis = 0)
 
     def _fill_default(self, array, indices, default_value):
         # h5py does not broadcast for fancy writes, materialize the selection
@@ -225,6 +275,19 @@ class ReplayBufferH5PY(ReplayBufferBase):
                 self.data[name][indices] = values[order]
             elif name in self.meta_fieldnames:
                 self.meta_data[name][indices] = values[order]
+
+        if self.track_write_step:
+            lens = data.get('episode_lens')
+            if not exists(lens):
+                lens = np.full(batch_size, self.max_timesteps, dtype = np.int32)
+            step = self.global_step
+            for raw_idx in range(batch_size):
+                ep_slot = int((self.episode_index + raw_idx) % self.max_episodes)
+                ep_len = int(lens[raw_idx])
+                if ep_len > 0:
+                    self._write_steps[ep_slot, :ep_len] = np.arange(step, step + ep_len, dtype = np.int64)
+                    step += ep_len
+            self.global_step = step
 
         self.episode_index = (self.episode_index + batch_size) % self.max_episodes
         self.num_episodes += batch_size
